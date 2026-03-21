@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# local runtime
+.codex-slot-relay-runtime/
+.env
+
+# editor
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,22 @@
+{
+  "listen": "127.0.0.1:8787",
+  "authToken": "relay-dev-token",
+  "profile": "codex-slot-relay",
+  "workspace": ".codex-slot-relay-runtime/min-workspace",
+  "runtimeRoot": ".codex-slot-relay-runtime",
+  "usageTtlSeconds": 300,
+  "requestTimeoutSeconds": 180,
+  "thinking": "off",
+  "selectionPolicy": "best-week-then-5h",
+  "thresholds": {
+    "min5hPct": 15,
+    "minWeekPct": 10
+  },
+  "cooldown": {
+    "genericErrorSeconds": 300,
+    "quotaErrorSeconds": 1800
+  },
+  "runner": {
+    "agentId": "relay"
+  }
+}
