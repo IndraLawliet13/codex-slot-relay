@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [
   { name = "Indra Yuda" }
 ]
-keywords = ["codex", "relay", "openai-compatible", "sse", "openclaw"]
+keywords = ["codex", "relay", "openai-compatible", "sse", "oauth", "routing", "multi-account"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",

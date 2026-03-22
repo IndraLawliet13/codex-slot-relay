@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/codex-slot-relay
-ExecStart=/usr/bin/env python3 /opt/codex-slot-relay/relay.py serve
+ExecStart=/usr/local/bin/codex-slot-relay --runtime-root /var/lib/codex-slot-relay serve
 Restart=always
 RestartSec=3
 

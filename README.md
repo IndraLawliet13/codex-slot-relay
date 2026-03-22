@@ -5,7 +5,7 @@
 ![Transport](https://img.shields.io/badge/Streaming-SSE-success)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
-Stateless OpenAI-compatible relay with slot-aware routing for Codex-backed requests.
+OpenAI-compatible relay with slot-aware routing for Codex-backed requests, using local runtime state and no external database.
 
 Designed to pair with [`codex-utils`](https://github.com/IndraLawliet13/codex-utils):
 
@@ -90,12 +90,20 @@ codex-slot-relay slot-list
 codex-slot-relay serve
 ```
 
+Quick sanity check:
+
+```bash
+curl -sS http://127.0.0.1:8787/healthz
+```
+
 Default local API target:
 
 - base URL: `http://127.0.0.1:8787/v1`
 - API key: `relay-dev-token`
 
 ## Example smoke test
+
+Use `relay-selftest` for plumbing-only verification, or `gpt-5.4` for a real slot-backed request.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8787/v1/chat/completions \
@@ -118,6 +126,9 @@ So after relay is up, `CodexClient()` can work without extra config.
 Main commands:
 
 - `codex-slot-relay init`
+- `codex-slot-relay setup` (legacy convenience bootstrap)
+- `codex-slot-relay sync-slots` (legacy bridge import)
+- `codex-slot-relay slot-import-main` (clearer alias for `sync-slots`)
 - `codex-slot-relay slot-login --slot 2 --label account@example.com`
 - `codex-slot-relay slot-auth-import-file --slot 2 --label imported@example.com --auth-file /path/to/auth-profiles.json`
 - `codex-slot-relay slot-auth-copy-profile --slot 3 --label copied@example.com --source-profile codex-slot-relay`
@@ -128,7 +139,7 @@ Main commands:
 - `codex-slot-relay slot-usage-set --slot slot-2 --usage5h '95% left · resets 3h' --usageWeek '84% left · resets 6d 23h'`
 - `codex-slot-relay slot-usage-copy-main --slot slot-2`
 - `codex-slot-relay refresh-usage`
-- `codex-slot-relay slot-import-main`
+- `codex-slot-relay health`
 - `codex-slot-relay dependency-map`
 - `codex-slot-relay test-runner --slot slot-2 --prompt "Reply with exactly pong"`
 - `codex-slot-relay serve`

@@ -49,6 +49,12 @@ codex-slot-relay refresh-usage
 codex-slot-relay serve
 ```
 
+Sanity-check the local health endpoint first:
+
+```bash
+curl -sS http://127.0.0.1:8787/healthz
+```
+
 ### 5) Smoke-test API
 
 ```bash
