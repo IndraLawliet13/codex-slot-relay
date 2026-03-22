@@ -99,7 +99,9 @@ So after the relay is running locally, a simple `CodexClient()` can work without
 
 See:
 - `docs/CODEX_UTILS.md`
+- `docs/OPERATOR_GUIDE.md`
 - `examples/quickstart_codex_utils.py`
+- `examples/local_pairing.sh`
 
 ## CLI overview
 
@@ -111,6 +113,8 @@ Main commands:
 - `codex-slot-relay slot-enable --slot 2`
 - `codex-slot-relay slot-disable --slot 2`
 - `codex-slot-relay slot-remove --slot 2`
+- `codex-slot-relay slot-usage-set --slot slot-2 --usage5h '95% left · resets 3h' --usageWeek '84% left · resets 6d 23h'`
+- `codex-slot-relay slot-usage-copy-main --slot slot-2`
 - `codex-slot-relay refresh-usage`
 - `codex-slot-relay slot-import-main`
 - `codex-slot-relay dependency-map`

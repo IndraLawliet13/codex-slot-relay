@@ -37,10 +37,12 @@ This is intentional because it provides a stable stepping stone:
 - easier to showcase now
 - easier to replace later with a more ambitious runner
 
-The first ambitious-mode step is already reflected in code/config:
+The first ambitious-mode steps are already reflected in code/config:
 - `auth.backend`
 - `usage.backend`
 - `runner.backend`
+
+Notably, `usage.backend` can now be switched to `local-cache`, which allows the relay to maintain and refresh slot usage snapshots locally without requiring `openclaw status --usage` for that part of the control plane.
 
 So the remaining OpenClaw dependency is now explicit and localized instead of being hidden implicitly.
 

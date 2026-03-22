@@ -20,7 +20,7 @@
     "backend": "openclaw"
   },
   "usage": {
-    "backend": "openclaw"
+    "backend": "local-cache"
   },
   "runner": {
     "backend": "openclaw",
