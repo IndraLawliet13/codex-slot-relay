@@ -20,10 +20,10 @@
     "backend": "openclaw"
   },
   "usage": {
-    "backend": "local-cache"
+    "backend": "openclaw"
   },
   "runner": {
-    "backend": "openclaw",
+    "backend": "codex-direct",
     "agentId": "relay"
   }
 }

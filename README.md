@@ -35,15 +35,16 @@ The relay exposes OpenAI-style endpoints while managing multiple Codex slots beh
 - legacy import bridge from a main OpenClaw slot store when needed
 - mock/self-test models for plumbing validation
 
-## Current safe-mode architecture
+## Current architecture
 
-This repository is intentionally in a **safe transitional mode**:
+This repository is in a **transitional but already usable mode**:
 
-- slot management is becoming self-contained inside the relay runtime
-- request execution is still **OpenClaw-backed** underneath
-- the public value today is the relay/control-plane design plus compatible HTTP surface
+- slot management is self-contained inside the relay runtime
+- auth and usage refresh still depend on OpenClaw
+- request execution now defaults to **`codex-direct`**, which calls the Codex backend directly without a per-request OpenClaw gateway
+- legacy runner fallback via `runner.backend=openclaw` still exists
 
-That means users can already clone and use it, while the future “ambitious mode” can replace the execution adapter later without breaking the public API shape.
+That means users can already clone and use it, while future steps can keep reducing the remaining OpenClaw-dependent pieces without breaking the public API shape.
 
 ## Quick start
 
@@ -132,7 +133,8 @@ Main commands:
 ## Notes
 
 - This relay is **stateless by design**.
-- Slot execution is currently **OpenClaw-backed** in safe mode.
+- Runner execution now defaults to **`codex-direct`** over the Codex Responses backend.
+- Auth and usage refresh are still OpenClaw-backed in this version.
 - The HTTP API surface is intended to remain stable even as the internal execution adapter evolves.
 
 ## License

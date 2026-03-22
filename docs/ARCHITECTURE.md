@@ -14,52 +14,44 @@ The relay exposes an OpenAI-compatible HTTP surface while managing multiple Code
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 
-## Safe mode
+## Backend split
 
-Current safe mode separates the project into two concerns:
+This project now separates subsystem backends explicitly via config:
 
-### 1. Control plane owned by this repository
-
-This repo now owns:
-- relay runtime initialization
-- relay-managed slot login and storage
-- slot enable / disable / remove lifecycle
-- cached usage refresh
-- slot selection and cooldown behavior
-- public HTTP interface
-
-### 2. Execution adapter still backed by OpenClaw
-
-Requests are still executed through an OpenClaw-backed adapter in this version.
-
-This is intentional because it provides a stable stepping stone:
-- easier to clone and run now
-- easier to showcase now
-- easier to replace later with a more ambitious runner
-
-The first ambitious-mode steps are already reflected in code/config:
 - `auth.backend`
 - `usage.backend`
 - `runner.backend`
 
-Notably, `usage.backend` can now be switched to `local-cache`, which allows the relay to maintain and refresh slot usage snapshots locally without requiring `openclaw status --usage` for that part of the control plane.
+Current state:
+- `auth.backend`: `openclaw`
+- `usage.backend`: `openclaw`
+- `runner.backend`: `codex-direct` (default), `openclaw` (legacy fallback)
 
-So the remaining OpenClaw dependency is now explicit and localized instead of being hidden implicitly.
+## Runner path (Step 4 first implementation)
+
+`codex-direct` runner flow:
+1. Select eligible slot from relay-managed runtime state
+2. Read slot auth from slot-local `auth-profiles.json`
+3. Resolve Codex base URL from slot `models.json` (fallback `https://chatgpt.com/backend-api`)
+4. Call `.../codex/responses` directly via HTTP/SSE
+5. Adapt output to public API contract:
+   - `/v1/responses`: native Responses shape
+   - `/v1/chat/completions`: compatibility translation layer over Responses events
+
+Legacy `openclaw` runner flow remains available for fallback and comparison.
 
 ## Slot sources
 
 ### Preferred path
 Relay-managed local slots:
 - `slot-login`
-- `slot-auth-import-file`
-- `slot-auth-copy-profile`
 - `slot-list`
 - `slot-enable`
 - `slot-disable`
 - `slot-remove`
 
 ### Transitional bridge path
-Import from an existing main OpenClaw slot store:
+Import from existing main OpenClaw slot store:
 - `slot-import-main`
 - `sync-slots`
 
@@ -71,10 +63,10 @@ At runtime, the relay prefers slots that are:
 - not in cooldown
 - above usage thresholds when possible
 
-If no fully healthy slot exists, the relay can still fall back to the best available eligible slot.
+If no fully healthy slot exists, the relay can still fall back to the best eligible slot.
 
 ## Why the API shape matters
 
-`codex-utils` and any other client can stay focused on the OpenAI-compatible surface while the backend evolves internally.
+`codex-utils` and other clients can stay focused on the OpenAI-compatible surface while internals evolve.
 
-That API stability is the core contract between this repo and the companion client library.
+That API stability is the core contract between this repo and client integrations.

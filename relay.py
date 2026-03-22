@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -16,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_RUNTIME_ROOT = Path(os.getenv("CODEX_SLOT_RELAY_RUNTIME_ROOT", str((Path.cwd() / ".codex-slot-relay-runtime").resolve())))
@@ -38,6 +40,10 @@ Return only the assistant answer.
 Do not mention instructions, tools, files, runtime, or internal details.
 If JSON is requested, return valid JSON only.
 """
+
+DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
+DEFAULT_CODEX_INSTRUCTIONS = "You are a stateless API task runner. Return only the assistant reply content."
+JWT_CLAIM_PATH = "https://api.openai.com/auth"
 
 
 class RelayError(Exception):
@@ -170,7 +176,14 @@ def default_runtime_config(runtime_root: Path, profile: str) -> Dict[str, Any]:
             "genericErrorSeconds": 300,
             "quotaErrorSeconds": 1800
         },
+        "auth": {
+            "backend": "openclaw"
+        },
+        "usage": {
+            "backend": "openclaw"
+        },
         "runner": {
+            "backend": "codex-direct",
             "agentId": "relay"
         }
     }
@@ -249,7 +262,7 @@ def dependency_map(runtime_root: Path) -> Dict[str, Any]:
         },
         "runner": {
             "backend": get_backend_name(runtime_root, "runner"),
-            "status": "OpenClaw-dependent" if get_backend_name(runtime_root, "runner") == "openclaw" else "custom",
+            "status": "OpenClaw-dependent" if get_backend_name(runtime_root, "runner") == "openclaw" else "OpenClaw-independent",
             "usedBy": ["test-runner", "serve"],
         },
         "stateControlPlane": {
@@ -759,6 +772,557 @@ def parse_json_from_mixed_output(raw: str) -> Dict[str, Any]:
     raise RelayError(f"failed to parse JSON object from output: {text[:500]}")
 
 
+def normalize_model_for_codex(model: str) -> str:
+    value = (model or "").strip()
+    if not value:
+        return "gpt-5.4"
+    if "/" in value:
+        value = value.rsplit("/", 1)[1]
+    return value
+
+
+def resolve_codex_responses_url(base_url: str) -> str:
+    raw = (base_url or "").strip() or DEFAULT_CODEX_BASE_URL
+    normalized = raw.rstrip("/")
+    if normalized.endswith("/codex/responses"):
+        return normalized
+    if normalized.endswith("/codex"):
+        return f"{normalized}/responses"
+    return f"{normalized}/codex/responses"
+
+
+def decode_jwt_payload(token: str) -> Dict[str, Any]:
+    parts = (token or "").split(".")
+    if len(parts) != 3:
+        raise RelayError("invalid codex access token format")
+    body = parts[1]
+    pad = "=" * ((4 - len(body) % 4) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(body + pad)
+        payload = json.loads(decoded.decode("utf-8"))
+    except Exception as exc:
+        raise RelayError(f"failed decoding codex access token payload: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RelayError("invalid codex access token payload")
+    return payload
+
+
+def extract_account_id_from_access_token(token: str) -> str:
+    payload = decode_jwt_payload(token)
+    claim = payload.get(JWT_CLAIM_PATH)
+    if isinstance(claim, dict):
+        account_id = str(claim.get("chatgpt_account_id") or "").strip()
+        if account_id:
+            return account_id
+    fallback = str(payload.get("chatgpt_account_id") or "").strip()
+    if fallback:
+        return fallback
+    raise RelayError("chatgpt_account_id not found in codex token")
+
+
+def pick_openai_codex_profile(auth: Dict[str, Any], preferred_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+    profiles = auth.get("profiles") if isinstance(auth.get("profiles"), dict) else {}
+    if preferred_id and preferred_id in profiles:
+        preferred = profiles.get(preferred_id)
+        if isinstance(preferred, dict) and preferred.get("provider") == "openai-codex":
+            return preferred_id, preferred
+    for profile_id, profile in profiles.items():
+        if isinstance(profile, dict) and profile.get("provider") == "openai-codex":
+            return str(profile_id), profile
+    raise RelayError("no openai-codex profile found in slot auth file")
+
+
+def load_slot_codex_auth(slot: Dict[str, Any]) -> Dict[str, Any]:
+    auth_file = Path(slot.get("authFile") or Path(slot.get("agentDir", "")) / "auth-profiles.json")
+    auth_data = load_json(auth_file, {})
+    preferred_profile = slot.get("sourceMeta", {}).get("profileId") if isinstance(slot.get("sourceMeta"), dict) else None
+    profile_id, profile = pick_openai_codex_profile(auth_data, preferred_id=preferred_profile)
+    access_token = str(profile.get("access") or "").strip()
+    if not access_token:
+        raise RelayError(f"missing codex access token in {auth_file}")
+    account_id = str(profile.get("accountId") or "").strip()
+    if not account_id:
+        account_id = extract_account_id_from_access_token(access_token)
+    return {
+        "profileId": profile_id,
+        "accessToken": access_token,
+        "refreshToken": str(profile.get("refresh") or "").strip(),
+        "accountId": account_id,
+        "expires": profile.get("expires"),
+    }
+
+
+def get_slot_codex_base_url(slot: Dict[str, Any]) -> str:
+    agent_dir = Path(slot.get("agentDir") or "")
+    models_path = agent_dir / "models.json"
+    models = load_json(models_path, {})
+    providers = models.get("providers") if isinstance(models.get("providers"), dict) else {}
+    codex = providers.get("openai-codex") if isinstance(providers.get("openai-codex"), dict) else {}
+    base_url = str(codex.get("baseUrl") or "").strip()
+    return base_url or DEFAULT_CODEX_BASE_URL
+
+
+def build_codex_headers(auth: Dict[str, Any], stream: bool, session_key: Optional[str] = None) -> Dict[str, str]:
+    user_agent = f"pi ({platform.system().lower()} {platform.release()}; {platform.machine()})"
+    headers = {
+        "Authorization": f"Bearer {auth['accessToken']}",
+        "chatgpt-account-id": str(auth.get("accountId") or ""),
+        "OpenAI-Beta": "responses=experimental",
+        "originator": "pi",
+        "User-Agent": user_agent,
+        "Accept": "text/event-stream" if stream else "application/json",
+        "Content-Type": "application/json",
+    }
+    if session_key:
+        headers["session_id"] = session_key
+    return headers
+
+
+def content_to_codex_blocks(content: Any, role: str) -> List[Dict[str, Any]]:
+    blocks: List[Dict[str, Any]] = []
+    block_type = "output_text" if role == "assistant" else "input_text"
+
+    def push_text(text: str) -> None:
+        value = str(text or "")
+        if value.strip():
+            blocks.append({"type": block_type, "text": value})
+
+    if isinstance(content, str):
+        push_text(content)
+        return blocks
+
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                push_text(item)
+                continue
+            if not isinstance(item, dict):
+                push_text(json.dumps(item, ensure_ascii=False))
+                continue
+            item_type = str(item.get("type") or "").lower()
+            if item_type in {"text", "input_text", "output_text"}:
+                push_text(str(item.get("text") or ""))
+            elif item_type in {"image_url", "input_image"}:
+                push_text("[image omitted in relay]")
+            elif item_type == "input_file":
+                push_text("[file omitted in relay]")
+            elif isinstance(item.get("text"), str):
+                push_text(str(item.get("text") or ""))
+            else:
+                push_text(json.dumps(item, ensure_ascii=False))
+        return blocks
+
+    if isinstance(content, dict):
+        if isinstance(content.get("text"), str):
+            push_text(str(content.get("text") or ""))
+        else:
+            push_text(json.dumps(content, ensure_ascii=False))
+        return blocks
+
+    push_text(json.dumps(content, ensure_ascii=False))
+    return blocks
+
+
+def build_codex_messages_from_openai_messages(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+    instructions_parts: List[str] = []
+    input_items: List[Dict[str, Any]] = []
+
+    for message in messages:
+        role = str(message.get("role") or "user").lower().strip() or "user"
+        if role in {"system", "developer"}:
+            text = flatten_content(message.get("content", "")).strip()
+            if text:
+                instructions_parts.append(text)
+            continue
+
+        if role == "tool":
+            role = "user"
+            text = flatten_content(message.get("content", "")).strip()
+            content_value: Any = f"[tool]\n{text}" if text else "[tool]"
+            blocks = content_to_codex_blocks(content_value, role="user")
+            input_items.append({
+                "type": "message",
+                "role": "user",
+                "content": blocks,
+            })
+            continue
+
+        codex_role = "assistant" if role == "assistant" else "user"
+        blocks = content_to_codex_blocks(message.get("content", ""), role=codex_role)
+        if not blocks:
+            continue
+        input_items.append({
+            "type": "message",
+            "role": codex_role,
+            "content": blocks,
+        })
+
+    instructions = "\n\n".join(part for part in instructions_parts if part).strip()
+    return instructions, input_items
+
+
+def ensure_reasoning_include(include: Any) -> List[str]:
+    values: List[str] = []
+    if isinstance(include, list):
+        for item in include:
+            text = str(item or "").strip()
+            if text:
+                values.append(text)
+    if "reasoning.encrypted_content" not in values:
+        values.append("reasoning.encrypted_content")
+    return values
+
+
+def translate_chat_completions_to_codex_payload(body: Dict[str, Any], model_hint: str, session_key: Optional[str]) -> Dict[str, Any]:
+    messages = body.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        raise RelayError("messages is required")
+    if body.get("tools"):
+        raise RelayError("tools belum didukung pada runner codex-direct untuk /v1/chat/completions")
+
+    instructions, input_items = build_codex_messages_from_openai_messages(messages)
+    if not input_items:
+        raise RelayError("missing user/assistant content in messages")
+
+    payload: Dict[str, Any] = {
+        "model": normalize_model_for_codex(str(body.get("model") or model_hint or "gpt-5.4")),
+        "instructions": instructions or DEFAULT_CODEX_INSTRUCTIONS,
+        "store": False,
+        "stream": True,
+        "input": input_items,
+        "text": {"verbosity": "medium"},
+        "include": ensure_reasoning_include(body.get("include")),
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+    temperature = body.get("temperature")
+    if isinstance(temperature, (int, float)):
+        payload["temperature"] = float(temperature)
+    if session_key:
+        payload["prompt_cache_key"] = session_key
+    return payload
+
+
+def translate_responses_to_codex_payload(body: Dict[str, Any], model_hint: str, session_key: Optional[str]) -> Dict[str, Any]:
+    messages = normalize_responses_input_to_messages(body)
+    has_user = any(
+        (str(msg.get("role") or "user").lower() in {"user", "tool"})
+        and flatten_content(msg.get("content", "")).strip()
+        for msg in messages
+    )
+    if not has_user:
+        raise RelayError("Missing user message in `input`.")
+
+    instructions, input_items = build_codex_messages_from_openai_messages(messages)
+    if not input_items:
+        raise RelayError("Missing user message in `input`.")
+
+    text_cfg = body.get("text") if isinstance(body.get("text"), dict) else {"verbosity": "medium"}
+    payload: Dict[str, Any] = {
+        "model": normalize_model_for_codex(str(body.get("model") or model_hint or "gpt-5.4")),
+        "instructions": instructions or str(body.get("instructions") or "").strip() or DEFAULT_CODEX_INSTRUCTIONS,
+        "store": False,
+        "stream": True,
+        "input": input_items,
+        "text": text_cfg,
+        "include": ensure_reasoning_include(body.get("include")),
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+    for key in ("temperature", "max_output_tokens", "reasoning", "tools", "tool_choice", "parallel_tool_calls", "metadata"):
+        if key in body:
+            payload[key] = body[key]
+
+    cache_key = body.get("prompt_cache_key")
+    if isinstance(cache_key, str) and cache_key.strip():
+        payload["prompt_cache_key"] = cache_key.strip()
+    elif session_key:
+        payload["prompt_cache_key"] = session_key
+
+    return payload
+
+
+def iter_sse_events(resp) -> Iterable[Tuple[Optional[str], str]]:
+    event_name: Optional[str] = None
+    data_lines: List[str] = []
+    while True:
+        raw = resp.readline()
+        if not raw:
+            break
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            if data_lines:
+                yield event_name, "\n".join(data_lines)
+            event_name = None
+            data_lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line[len("event:"):].strip() or None
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[len("data:"):].lstrip())
+    if data_lines:
+        yield event_name, "\n".join(data_lines)
+
+
+def extract_text_from_codex_response_obj(response_obj: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    output = response_obj.get("output")
+    if not isinstance(output, list):
+        return ""
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type") or "").lower() == "output_text":
+                text = str(block.get("text") or "")
+                if text:
+                    parts.append(text)
+    return "".join(parts).strip()
+
+
+def collect_codex_stream_result(resp) -> Dict[str, Any]:
+    collected: List[Dict[str, Any]] = []
+    text_parts: List[str] = []
+    response_created: Optional[Dict[str, Any]] = None
+    response_completed: Optional[Dict[str, Any]] = None
+
+    for _event_name, data in iter_sse_events(resp):
+        if data.strip() == "[DONE]":
+            break
+        try:
+            obj = json.loads(data)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        collected.append(obj)
+        event_type = str(obj.get("type") or "")
+        if event_type == "response.output_text.delta":
+            delta = str(obj.get("delta") or "")
+            if delta:
+                text_parts.append(delta)
+        elif event_type == "response.output_text.done" and not text_parts:
+            done_text = str(obj.get("text") or "")
+            if done_text:
+                text_parts.append(done_text)
+        elif event_type in {"response.created", "response.in_progress"}:
+            response_obj = obj.get("response")
+            if isinstance(response_obj, dict):
+                response_created = response_obj
+        elif event_type in {"response.completed", "response.done"}:
+            response_obj = obj.get("response")
+            if isinstance(response_obj, dict):
+                response_completed = response_obj
+
+    response_obj = response_completed or response_created or {}
+    text = "".join(text_parts).strip()
+    if not text and isinstance(response_obj, dict):
+        text = extract_text_from_codex_response_obj(response_obj)
+
+    return {
+        "events": collected,
+        "response": response_obj if isinstance(response_obj, dict) else {},
+        "text": text,
+    }
+
+
+def open_codex_stream_request(
+    slot: Dict[str, Any],
+    payload: Dict[str, Any],
+    timeout: int,
+    session_key: Optional[str] = None,
+    *,
+    raise_retryable: bool = False,
+):
+    auth = load_slot_codex_auth(slot)
+    url = resolve_codex_responses_url(get_slot_codex_base_url(slot))
+    headers = build_codex_headers(auth, stream=True, session_key=session_key)
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read()
+        if raise_retryable and should_retry_upstream_status(exc.code):
+            raise RetryableUpstreamError(exc.code, error_body, dict(exc.headers))
+        detail = error_body.decode("utf-8", errors="replace").strip()
+        message = detail or f"codex upstream http {exc.code}"
+        raise RelayError(message)
+
+
+def run_slot_prompt_codex_direct(slot: Dict[str, Any], prompt: str, timeout: int, session_key: Optional[str] = None) -> Dict[str, Any]:
+    payload = {
+        "model": normalize_model_for_codex(str(slot.get("modelDefault") or "gpt-5.4")),
+        "instructions": DEFAULT_CODEX_INSTRUCTIONS,
+        "store": False,
+        "stream": True,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt}],
+        }],
+        "text": {"verbosity": "medium"},
+        "include": ["reasoning.encrypted_content"],
+    }
+    with open_codex_stream_request(slot, payload, timeout, session_key=session_key, raise_retryable=False) as resp:
+        result = collect_codex_stream_result(resp)
+
+    response_obj = result.get("response") if isinstance(result.get("response"), dict) else {}
+    text = str(result.get("text") or "").strip()
+    if not text:
+        raise RelayError("no text payload returned from codex-direct")
+    session_id = str(response_obj.get("id") or f"resp_{uuid.uuid4().hex}")
+    return {
+        "sessionId": session_id,
+        "text": text,
+        "raw": response_obj,
+    }
+
+
+def finalize_responses_payload_from_codex(result: Dict[str, Any], fallback_model: str) -> Dict[str, Any]:
+    response_obj = result.get("response") if isinstance(result.get("response"), dict) else {}
+    text = str(result.get("text") or "")
+
+    if response_obj:
+        payload = json.loads(json.dumps(response_obj))
+        payload.setdefault("id", f"resp_{uuid.uuid4().hex}")
+        payload.setdefault("object", "response")
+        payload.setdefault("created_at", int(time.time()))
+        payload.setdefault("status", "completed")
+        payload.setdefault("model", normalize_model_for_codex(str(payload.get("model") or fallback_model or "gpt-5.4")))
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            payload["usage"] = create_empty_responses_usage()
+        output = payload.get("output")
+        if not isinstance(output, list) or not output:
+            payload["output"] = [
+                create_assistant_output_item(f"msg_{uuid.uuid4().hex}", text, status="completed")
+            ]
+        return payload
+
+    return create_response_resource(
+        f"resp_{uuid.uuid4().hex}",
+        normalize_model_for_codex(str(fallback_model or "gpt-5.4")),
+        "completed",
+        [create_assistant_output_item(f"msg_{uuid.uuid4().hex}", text, status="completed")],
+    )
+
+
+def stream_codex_chat_chunks(handler: "RelayHandler", resp, model_hint: str) -> None:
+    completion_id = f"chatcmpl-relay-{uuid.uuid4().hex[:12]}"
+    model = normalize_model_for_codex(model_hint)
+    role_sent = False
+    delta_sent = False
+
+    handler._set_sse_headers()
+    for _event_name, data in iter_sse_events(resp):
+        if data.strip() == "[DONE]":
+            break
+        try:
+            obj = json.loads(data)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        event_type = str(obj.get("type") or "")
+        if event_type in {"response.created", "response.in_progress", "response.completed", "response.done"}:
+            response_obj = obj.get("response")
+            if isinstance(response_obj, dict):
+                upstream_id = str(response_obj.get("id") or "").strip()
+                if upstream_id:
+                    completion_id = upstream_id
+                upstream_model = str(response_obj.get("model") or "").strip()
+                if upstream_model:
+                    model = normalize_model_for_codex(upstream_model)
+
+        if event_type == "response.output_text.delta":
+            delta = str(obj.get("delta") or "")
+            if not delta:
+                continue
+            if not role_sent:
+                handler._write_sse_data(build_chat_completion_chunk(completion_id, model, {"role": "assistant"}, None))
+                role_sent = True
+            handler._write_sse_data(build_chat_completion_chunk(completion_id, model, {"content": delta}, None))
+            delta_sent = True
+        elif event_type == "response.output_text.done" and not delta_sent:
+            done_text = str(obj.get("text") or "")
+            if done_text:
+                if not role_sent:
+                    handler._write_sse_data(build_chat_completion_chunk(completion_id, model, {"role": "assistant"}, None))
+                    role_sent = True
+                handler._write_sse_data(build_chat_completion_chunk(completion_id, model, {"content": done_text}, None))
+        elif event_type in {"response.completed", "response.done"}:
+            break
+
+    if not role_sent:
+        handler._write_sse_data(build_chat_completion_chunk(completion_id, model, {"role": "assistant"}, None))
+    handler._write_sse_data(build_chat_completion_chunk(completion_id, model, {}, "stop"))
+    handler._write_done()
+    handler.close_connection = True
+
+
+def stream_via_slot_codex_direct(handler: "RelayHandler", path: str, body: Dict[str, Any], slot: Dict[str, Any], payload_override: Optional[Dict[str, Any]] = None) -> bool:
+    timeout = int(handler.server.relay_config.get("requestTimeoutSeconds", 180)) + 30
+    session_key = handler.headers.get("x-openclaw-session-key")
+    model_hint = str(body.get("model") or slot.get("modelDefault") or "gpt-5.4")
+
+    if payload_override is not None:
+        payload = json.loads(json.dumps(payload_override))
+    else:
+        if path == "/v1/chat/completions":
+            payload = translate_chat_completions_to_codex_payload(body, model_hint=model_hint, session_key=session_key)
+        else:
+            payload = translate_responses_to_codex_payload(body, model_hint=model_hint, session_key=session_key)
+
+    payload["model"] = normalize_model_for_codex(str(body.get("model") or payload.get("model") or model_hint))
+    payload["stream"] = True
+
+    with open_codex_stream_request(slot, payload, timeout, session_key=session_key, raise_retryable=True) as resp:
+        client_stream = bool(body.get("stream"))
+        if client_stream:
+            if path == "/v1/chat/completions":
+                stream_codex_chat_chunks(handler, resp, payload["model"])
+                return True
+
+            handler.send_response(resp.status)
+            handler.send_header("Content-Type", resp.headers.get("Content-Type", "text/event-stream; charset=utf-8"))
+            handler.send_header("Cache-Control", resp.headers.get("Cache-Control", "no-cache"))
+            handler.send_header("Connection", "close")
+            handler.send_header("X-Accel-Buffering", "no")
+            handler.end_headers()
+            while True:
+                reader = getattr(resp, "read1", None)
+                chunk = reader(4096) if callable(reader) else resp.read(4096)
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+                handler.wfile.flush()
+            handler.close_connection = True
+            return True
+
+        result = collect_codex_stream_result(resp)
+        if path == "/v1/chat/completions":
+            response_obj = result.get("response") if isinstance(result.get("response"), dict) else {}
+            effective_model = normalize_model_for_codex(str(response_obj.get("model") or payload["model"] or model_hint))
+            handler._send_json(200, build_chat_completion_payload(effective_model, str(result.get("text") or ""), {}))
+            return True
+
+        handler._send_json(200, finalize_responses_payload_from_codex(result, payload["model"]))
+        return True
+
+
 def build_request_runtime(slot: Dict[str, Any], runtime_root: Path, profile: str) -> Dict[str, Path]:
     req_root = Path(tempfile.mkdtemp(prefix="req-", dir=str(runtime_root / "run")))
     state_dir = req_root / "state"
@@ -910,7 +1474,7 @@ def send_raw_http_response(handler: "RelayHandler", status: int, headers: Option
         handler.wfile.write(body)
 
 
-def stream_via_slot_gateway(handler: "RelayHandler", path: str, body: Dict[str, Any], slot: Dict[str, Any]) -> None:
+def stream_via_slot_gateway(handler: "RelayHandler", path: str, body: Dict[str, Any], slot: Dict[str, Any]) -> bool:
     gateway_ctx = start_slot_gateway(slot, handler.server.relay_config["profile"], handler.server.runtime_root)
     try:
         upstream_headers = {
@@ -956,6 +1520,7 @@ def stream_via_slot_gateway(handler: "RelayHandler", path: str, body: Dict[str, 
                 raise RetryableUpstreamError(exc.code, error_body, dict(exc.headers))
             send_raw_http_response(handler, exc.code, dict(exc.headers), error_body)
             return False
+        return True
     finally:
         stop_slot_gateway(gateway_ctx)
 
@@ -1144,6 +1709,8 @@ def resolve_error_status(message: str) -> Tuple[int, str, Optional[str]]:
         "missing user message",
         "input is required",
         "invalid request body",
+        "belum didukung",
+        "unsupported",
     ]):
         return 400, "invalid_request_error", None
     if any(needle in lowered for needle in ["unauthorized", "invalid api key"]):
@@ -1242,6 +1809,10 @@ def normalize_responses_input_to_messages(payload: Dict[str, Any]) -> List[Dict[
     return messages
 
 
+def get_runner_backend_from_config(config: Dict[str, Any]) -> str:
+    return str(config.get("runner", {}).get("backend", "openclaw") or "openclaw")
+
+
 def execute_relay_completion(server: "RelayServer", requested_model: str, prompt: str, source_messages: Optional[List[Dict[str, Any]]] = None) -> Tuple[str, str, Dict[str, Any]]:
     requested_model = requested_model or "gpt-5.4"
     if is_mock_model(requested_model):
@@ -1256,6 +1827,7 @@ def execute_relay_completion(server: "RelayServer", requested_model: str, prompt
     timeout = int(server.relay_config.get("requestTimeoutSeconds", 180))
     thinking = str(server.relay_config.get("thinking", "off"))
     runner_agent = str(server.relay_config.get("runner", {}).get("agentId", "relay"))
+    runner_backend = get_runner_backend_from_config(server.relay_config)
 
     slots = choose_slots(server.relay_config, server.slot_store.load_slots(), False, server.runtime_root)
     if not slots:
@@ -1267,9 +1839,16 @@ def execute_relay_completion(server: "RelayServer", requested_model: str, prompt
         tried.append(slot["id"])
         try:
             BUSY_TRACKER.acquire(slot["id"])
-            result = run_slot_prompt(slot, prompt, server.relay_config["profile"], timeout, thinking, runner_agent, server.runtime_root)
+            if runner_backend == "codex-direct":
+                result = run_slot_prompt_codex_direct(slot, prompt, timeout)
+            elif runner_backend == "openclaw":
+                result = run_slot_prompt(slot, prompt, server.relay_config["profile"], timeout, thinking, runner_agent, server.runtime_root)
+            else:
+                raise RelayError(f"runner backend '{runner_backend}' belum didukung")
+
             if upstream_error_text(result.get("text", "")):
                 raise RelayError(f"upstream returned error-like text: {result.get('text', '')[:240]}")
+
             current_slots = server.slot_store.load_slots()
             by_id = {s["id"]: s for s in current_slots}
             if slot["id"] in by_id:
@@ -1418,12 +1997,28 @@ class RelayHandler(BaseHTTPRequestHandler):
         if not slots:
             raise RelayError("tidak ada slot Codex yang eligible")
 
+        runner_backend = get_runner_backend_from_config(self.server.relay_config)
+        if runner_backend not in {"openclaw", "codex-direct"}:
+            raise RelayError(f"runner backend '{runner_backend}' belum didukung")
+
+        payload_override: Optional[Dict[str, Any]] = None
+        if runner_backend == "codex-direct":
+            model_hint = str(body.get("model") or "gpt-5.4")
+            session_key = self.headers.get("x-openclaw-session-key")
+            if path == "/v1/chat/completions":
+                payload_override = translate_chat_completions_to_codex_payload(body, model_hint=model_hint, session_key=session_key)
+            else:
+                payload_override = translate_responses_to_codex_payload(body, model_hint=model_hint, session_key=session_key)
+
         last_retry: Optional[RetryableUpstreamError] = None
         last_error = None
         for slot in slots[:2]:
             try:
                 BUSY_TRACKER.acquire(slot["id"])
-                proxied_ok = stream_via_slot_gateway(self, path, body, slot)
+                if runner_backend == "codex-direct":
+                    proxied_ok = stream_via_slot_codex_direct(self, path, body, slot, payload_override=payload_override)
+                else:
+                    proxied_ok = stream_via_slot_gateway(self, path, body, slot)
                 current_slots = self.server.slot_store.load_slots()
                 by_id = {s["id"]: s for s in current_slots}
                 if proxied_ok and slot["id"] in by_id:
@@ -1699,15 +2294,28 @@ def cmd_test_runner(args: argparse.Namespace) -> int:
             break
     if not slot:
         raise SystemExit(f"slot not found: {target_slot}")
-    result = run_slot_prompt(
-        slot=slot,
-        prompt=args.prompt,
-        profile=config["profile"],
-        timeout=int(config.get("requestTimeoutSeconds", 180)),
-        thinking=str(config.get("thinking", "off")),
-        agent_id=str(config.get("runner", {}).get("agentId", "relay")),
-        runtime_root=args.runtime_root,
-    )
+
+    timeout = int(config.get("requestTimeoutSeconds", 180))
+    runner_backend = get_runner_backend_from_config(config)
+    if runner_backend == "codex-direct":
+        result = run_slot_prompt_codex_direct(
+            slot=slot,
+            prompt=args.prompt,
+            timeout=timeout,
+        )
+    elif runner_backend == "openclaw":
+        result = run_slot_prompt(
+            slot=slot,
+            prompt=args.prompt,
+            profile=config["profile"],
+            timeout=timeout,
+            thinking=str(config.get("thinking", "off")),
+            agent_id=str(config.get("runner", {}).get("agentId", "relay")),
+            runtime_root=args.runtime_root,
+        )
+    else:
+        raise SystemExit(f"runner backend belum didukung: {runner_backend}")
+
     print(json.dumps({
         "slot": slot["id"],
         "sessionId": result["sessionId"],
