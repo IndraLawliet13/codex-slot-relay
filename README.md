@@ -109,6 +109,8 @@ Main commands:
 
 - `codex-slot-relay init`
 - `codex-slot-relay slot-login --slot 2 --label account@example.com`
+- `codex-slot-relay slot-auth-import-file --slot 2 --label imported@example.com --auth-file /path/to/auth-profiles.json`
+- `codex-slot-relay slot-auth-copy-profile --slot 3 --label copied@example.com --source-profile codex-slot-relay`
 - `codex-slot-relay slot-list`
 - `codex-slot-relay slot-enable --slot 2`
 - `codex-slot-relay slot-disable --slot 2`

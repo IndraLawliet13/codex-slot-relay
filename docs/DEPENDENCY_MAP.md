@@ -18,14 +18,22 @@ These commands manage relay-owned metadata and slot directories without needing 
 ## Still OpenClaw-dependent today
 
 ### 1. Auth backend
-Current backend: `openclaw`
+Current backend can be:
+- `openclaw`
+- `file-import`
+- `profile-copy`
 
 Used by:
 - `slot-login`
+- `slot-auth-import-file`
+- `slot-auth-copy-profile`
 
-Why it still depends on OpenClaw:
-- the interactive Codex/OAuth login flow is still delegated to OpenClaw today
-- after login succeeds, the relay harvests the resulting auth into the relay-local slot directory
+Current status:
+- if `auth.backend=openclaw`, interactive Codex/OAuth login is still delegated to OpenClaw
+- if you use `slot-auth-import-file`, auth onboarding can happen by importing a compatible `auth-profiles.json` directly into the relay-local slot state
+- if you use `slot-auth-copy-profile`, auth onboarding can happen by copying auth from another OpenClaw profile/agent directory without running the relay login command itself
+
+So auth is no longer limited to one OpenClaw-only onboarding path, even though a fully native no-OpenClaw OAuth flow is still a future step.
 
 ### 2. Usage backend
 Current backend: `openclaw`

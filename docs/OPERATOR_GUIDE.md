@@ -10,11 +10,28 @@ codex-slot-relay init
 
 ## Add a new account directly into the relay
 
+### Option A: interactive login path
 ```bash
 codex-slot-relay slot-login --slot 1 --label your-email@example.com
 ```
 
 This uses the current auth backend and then stores the resulting auth in the relay-local slot directory.
+
+### Option B: import an existing auth file directly
+```bash
+codex-slot-relay slot-auth-import-file \
+  --slot 2 \
+  --label imported@example.com \
+  --auth-file /path/to/auth-profiles.json
+```
+
+### Option C: copy auth from another OpenClaw profile
+```bash
+codex-slot-relay slot-auth-copy-profile \
+  --slot 3 \
+  --label copied@example.com \
+  --source-profile codex-slot-relay
+```
 
 ## Import an existing account from the main slot store
 

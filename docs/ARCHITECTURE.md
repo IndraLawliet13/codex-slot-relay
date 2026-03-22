@@ -51,6 +51,8 @@ So the remaining OpenClaw dependency is now explicit and localized instead of be
 ### Preferred path
 Relay-managed local slots:
 - `slot-login`
+- `slot-auth-import-file`
+- `slot-auth-copy-profile`
 - `slot-list`
 - `slot-enable`
 - `slot-disable`
