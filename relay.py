@@ -261,6 +261,34 @@ def ensure_slot_models(agent_dir: Path) -> None:
     save_json(dest, {"providers": {}})
 
 
+def relay_profile_agent_dir(profile: str, runtime_root: Optional[Path] = None) -> Path:
+    agent_id = "relay"
+    if runtime_root:
+        try:
+            cfg = load_json(runtime_config_path(runtime_root), {})
+            agent_id = str(cfg.get("runner", {}).get("agentId", "relay"))
+        except Exception:
+            agent_id = "relay"
+    return Path.home() / f".openclaw-{profile}" / "agents" / agent_id / "agent"
+
+
+def copy_profile_auth_into_slot(runtime_root: Path, profile: str, slot_id: str) -> Optional[Path]:
+    slot_id = normalize_slot_id(slot_id)
+    source_agent = relay_profile_agent_dir(profile, runtime_root=runtime_root)
+    source_auth = source_agent / "auth-profiles.json"
+    if not source_auth.exists():
+        return None
+    target_agent = slot_agent_dir(runtime_root, slot_id)
+    ensure_dir(target_agent)
+    shutil.copy2(source_auth, target_agent / "auth-profiles.json")
+    source_models = source_agent / "models.json"
+    if source_models.exists():
+        shutil.copy2(source_models, target_agent / "models.json")
+    else:
+        ensure_slot_models(target_agent)
+    return target_agent / "auth-profiles.json"
+
+
 def upsert_slot_record(
     runtime_root: Path,
     slot_id: str,
@@ -485,6 +513,10 @@ def login_slot(runtime_root: Path, profile: str, slot_id: str, label: str) -> Di
         raise RelayError(f"slot login gagal untuk {slot_id} (exit {code})")
 
     auth_file = agent_dir / "auth-profiles.json"
+    if not auth_file.exists():
+        copied = copy_profile_auth_into_slot(runtime_root, profile, slot_id)
+        if copied:
+            auth_file = copied
     if not auth_file.exists():
         raise RelayError(f"auth file tidak ditemukan setelah login: {auth_file}")
 
