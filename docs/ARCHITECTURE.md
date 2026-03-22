@@ -2,7 +2,7 @@
 
 ## Public shape
 
-The relay exposes an OpenAI-compatible HTTP surface while managing multiple Codex slots behind the scenes.
+`codex-slot-relay` exposes an OpenAI-compatible HTTP surface while managing multiple Codex accounts as slots.
 
 ### API surface
 
@@ -16,57 +16,96 @@ The relay exposes an OpenAI-compatible HTTP surface while managing multiple Code
 
 ## Backend split
 
-This project now separates subsystem backends explicitly via config:
+Backends are explicit per subsystem:
 
 - `auth.backend`
 - `usage.backend`
 - `runner.backend`
 
-Current state:
-- `auth.backend`: `openclaw`
-- `usage.backend`: `openclaw`
-- `runner.backend`: `codex-direct` (default), `openclaw` (legacy fallback)
+### Default (standalone-first)
 
-## Runner path (Step 4 first implementation)
+- `auth.backend = native`
+- `usage.backend = codex-api`
+- `runner.backend = codex-direct`
 
-`codex-direct` runner flow:
-1. Select eligible slot from relay-managed runtime state
-2. Read slot auth from slot-local `auth-profiles.json`
-3. Resolve Codex base URL from slot `models.json` (fallback `https://chatgpt.com/backend-api`)
-4. Call `.../codex/responses` directly via HTTP/SSE
-5. Adapt output to public API contract:
+### Legacy fallback (optional)
+
+- `auth.backend = openclaw`
+- `usage.backend = openclaw`
+- `runner.backend = openclaw`
+
+## Auth subsystem
+
+### Native auth flow
+
+`slot-login` native path:
+1. Build OAuth authorize URL with PKCE
+2. User completes login in browser
+3. User pastes callback URL/code into terminal
+4. Relay exchanges code at `https://auth.openai.com/oauth/token`
+5. Relay stores slot-local OAuth profile (`access`, `refresh`, `expires`, `accountId`)
+
+### Native token lifecycle
+
+Before Codex calls, relay checks token expiry and refreshes using refresh token when needed.
+
+## Usage subsystem
+
+### `codex-api` backend
+
+Usage refresh path:
+- `GET https://chatgpt.com/backend-api/wham/usage`
+- headers:
+  - `Authorization: Bearer <access>`
+  - `User-Agent: CodexBar`
+  - `Accept: application/json`
+  - optional `ChatGPT-Account-Id`
+
+### `local-cache` backend
+
+No network call. Uses slot-local usage snapshot; update via:
+- `slot-usage-set`
+- `slot-usage-copy-main`
+
+## Runner subsystem
+
+### `codex-direct` backend
+
+1. Select eligible slot from runtime state
+2. Load slot auth from slot-local `auth-profiles.json`
+3. Refresh token when near expiry
+4. Call `.../codex/responses` directly (`chatgpt.com/backend-api`)
+5. Adapt to public API contract:
    - `/v1/responses`: native Responses shape
-   - `/v1/chat/completions`: compatibility translation layer over Responses events
+   - `/v1/chat/completions`: compatibility translation over Responses stream
 
-Legacy `openclaw` runner flow remains available for fallback and comparison.
+`runner.backend=openclaw` remains as optional legacy path.
 
 ## Slot sources
 
-### Preferred path
-Relay-managed local slots:
-- `slot-login`
-- `slot-list`
-- `slot-enable`
-- `slot-disable`
-- `slot-remove`
+### Preferred
 
-### Transitional bridge path
-Import from existing main OpenClaw slot store:
+Relay-managed local slots:
+- native login
+- auth import file
+- auth copy profile
+
+### Bridge path
+
+Import from existing OpenClaw slot metadata:
 - `slot-import-main`
 - `sync-slots`
 
 ## Selection behavior
 
-At runtime, the relay prefers slots that are:
+At runtime the relay prefers slots that are:
 - enabled
 - not busy
 - not in cooldown
-- above usage thresholds when possible
+- above configured usage thresholds when possible
 
-If no fully healthy slot exists, the relay can still fall back to the best eligible slot.
+If no fully healthy slot exists, relay can still fall back to best available slot.
 
-## Why the API shape matters
+## Why this shape matters
 
-`codex-utils` and other clients can stay focused on the OpenAI-compatible surface while internals evolve.
-
-That API stability is the core contract between this repo and client integrations.
+Client side (`codex-utils`) can stay stable on the OpenAI-compatible API while backend internals evolve.

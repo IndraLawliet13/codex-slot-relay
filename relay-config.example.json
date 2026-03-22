@@ -17,10 +17,10 @@
     "quotaErrorSeconds": 1800
   },
   "auth": {
-    "backend": "openclaw"
+    "backend": "native"
   },
   "usage": {
-    "backend": "openclaw"
+    "backend": "codex-api"
   },
   "runner": {
     "backend": "codex-direct",

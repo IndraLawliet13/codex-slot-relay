@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import hashlib
 import json
 import os
 import platform
@@ -15,10 +16,12 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlencode, urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_RUNTIME_ROOT = Path(os.getenv("CODEX_SLOT_RELAY_RUNTIME_ROOT", str((Path.cwd() / ".codex-slot-relay-runtime").resolve())))
@@ -43,7 +46,17 @@ If JSON is requested, return valid JSON only.
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_CODEX_INSTRUCTIONS = "You are a stateless API task runner. Return only the assistant reply content."
+DEFAULT_CODEX_USAGE_URL = f"{DEFAULT_CODEX_BASE_URL}/wham/usage"
 JWT_CLAIM_PATH = "https://api.openai.com/auth"
+PROFILE_CLAIM_PATH = "https://api.openai.com/profile"
+OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+OPENAI_CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
+OPENAI_CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+OPENAI_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
+OPENAI_CODEX_SCOPE = "openid profile email offline_access"
+OPENAI_CODEX_ORIGINATOR = "pi"
+AUTH_REFRESH_LEEWAY_SECONDS = 300
+OAUTH_CALLBACK_TIMEOUT_SECONDS = 600
 
 
 class RelayError(Exception):
@@ -177,10 +190,10 @@ def default_runtime_config(runtime_root: Path, profile: str) -> Dict[str, Any]:
             "quotaErrorSeconds": 1800
         },
         "auth": {
-            "backend": "openclaw"
+            "backend": "native"
         },
         "usage": {
-            "backend": "openclaw"
+            "backend": "codex-api"
         },
         "runner": {
             "backend": "codex-direct",
@@ -234,43 +247,64 @@ def make_profile_config(runtime_root: Path, profile: str, workspace: Optional[Pa
     }
 
 
-def get_backend_name(runtime_root: Path, section: str, default: str = "openclaw") -> str:
+SECTION_DEFAULT_BACKENDS: Dict[str, str] = {
+    "auth": "native",
+    "usage": "codex-api",
+    "runner": "codex-direct",
+}
+
+SECTION_SUPPORTED_BACKENDS: Dict[str, Tuple[str, ...]] = {
+    "auth": ("native", "openclaw"),
+    "usage": ("codex-api", "local-cache", "openclaw"),
+    "runner": ("codex-direct", "openclaw"),
+}
+
+SECTION_USED_BY: Dict[str, Tuple[str, ...]] = {
+    "auth": ("slot-login", "slot-auth-import-file", "slot-auth-copy-profile"),
+    "usage": ("refresh-usage", "slot-usage-set", "slot-usage-copy-main", "slot-login"),
+    "runner": ("test-runner", "serve"),
+}
+
+OPENCLAW_INDEPENDENT_BACKENDS: Dict[str, Tuple[str, ...]] = {
+    "auth": ("native",),
+    "usage": ("codex-api", "local-cache"),
+    "runner": ("codex-direct",),
+}
+
+
+def get_backend_name(runtime_root: Path, section: str, default: Optional[str] = None) -> str:
     cfg = load_json(runtime_config_path(runtime_root), {})
-    return str(cfg.get(section, {}).get("backend", default))
+    fallback = default or SECTION_DEFAULT_BACKENDS.get(section, "openclaw")
+    return str(cfg.get(section, {}).get("backend", fallback) or fallback)
 
 
-def assert_supported_backend(runtime_root: Path, section: str, supported: Iterable[str], *, purpose: str) -> str:
+def assert_supported_backend(runtime_root: Path, section: str, supported: Optional[Iterable[str]] = None, *, purpose: str) -> str:
     backend = get_backend_name(runtime_root, section)
-    if backend not in supported:
-        supported_text = ", ".join(sorted(set(supported)))
+    allowed = tuple(supported or SECTION_SUPPORTED_BACKENDS.get(section, (backend,)))
+    if backend not in allowed:
+        supported_text = ", ".join(sorted(set(allowed)))
         raise RelayError(f"{purpose} backend '{backend}' belum didukung. backend yang tersedia saat ini: {supported_text}")
     return backend
 
 
 def dependency_map(runtime_root: Path) -> Dict[str, Any]:
-    cfg = load_json(runtime_config_path(runtime_root), {})
-    return {
-        "auth": {
-            "backend": get_backend_name(runtime_root, "auth"),
-            "status": "OpenClaw-dependent" if get_backend_name(runtime_root, "auth") == "openclaw" else "custom",
-            "usedBy": ["slot-login"],
-        },
-        "usage": {
-            "backend": get_backend_name(runtime_root, "usage"),
-            "status": "OpenClaw-dependent" if get_backend_name(runtime_root, "usage") == "openclaw" else "custom",
-            "usedBy": ["refresh-usage", "slot-login"],
-        },
-        "runner": {
-            "backend": get_backend_name(runtime_root, "runner"),
-            "status": "OpenClaw-dependent" if get_backend_name(runtime_root, "runner") == "openclaw" else "OpenClaw-independent",
-            "usedBy": ["test-runner", "serve"],
-        },
-        "stateControlPlane": {
-            "backend": "local-runtime",
-            "status": "OpenClaw-independent",
-            "usedBy": ["init", "slot-list", "slot-enable", "slot-disable", "slot-remove"],
-        },
+    mapping: Dict[str, Any] = {}
+    for section in ("auth", "usage", "runner"):
+        backend = get_backend_name(runtime_root, section)
+        supported = list(SECTION_SUPPORTED_BACKENDS.get(section, (backend,)))
+        status = "OpenClaw-independent" if backend in OPENCLAW_INDEPENDENT_BACKENDS.get(section, ()) else "OpenClaw-dependent"
+        mapping[section] = {
+            "configuredBackend": backend,
+            "supportedBackends": supported,
+            "status": status,
+            "usedBy": list(SECTION_USED_BY.get(section, ())),
+        }
+    mapping["stateControlPlane"] = {
+        "backend": "local-runtime",
+        "status": "OpenClaw-independent",
+        "usedBy": ["init", "slot-list", "slot-enable", "slot-disable", "slot-remove"],
     }
+    return mapping
 
 
 def setup_runtime(runtime_root: Path, profile: str, force: bool = False) -> None:
@@ -284,20 +318,130 @@ def setup_runtime(runtime_root: Path, profile: str, force: bool = False) -> None
     if force or not cfg_path.exists():
         save_json(cfg_path, default_runtime_config(runtime_root, profile))
 
-    profile_dir = Path.home() / f".openclaw-{profile}"
-    ensure_dir(profile_dir)
-    profile_cfg_path = profile_dir / "openclaw.json"
-    save_json(profile_cfg_path, make_profile_config(runtime_root, profile, workspace=workspace))
+    cfg = load_json(cfg_path, default_runtime_config(runtime_root, profile))
+    openclaw_needed = any(str(cfg.get(section, {}).get("backend", "")) == "openclaw" for section in ("auth", "usage", "runner"))
+    if openclaw_needed or MAIN_OPENCLAW_CONFIG.exists():
+        profile_dir = Path.home() / f".openclaw-{profile}"
+        ensure_dir(profile_dir)
+        profile_cfg_path = profile_dir / "openclaw.json"
+        save_json(profile_cfg_path, make_profile_config(runtime_root, profile, workspace=workspace))
+
+
+def coerce_epoch_ms(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            return int(raw)
+        dt = parse_iso_or_none(raw)
+        if dt is not None:
+            return int(dt.timestamp() * 1000)
+    return None
+
+
+def extract_email_from_access_token(token: str) -> Optional[str]:
+    payload = decode_jwt_payload(token)
+    profile = payload.get(PROFILE_CLAIM_PATH)
+    if isinstance(profile, dict):
+        email = str(profile.get("email") or "").strip()
+        if email:
+            return email
+    return None
+
+
+def extract_expires_ms_from_access_token(token: str) -> Optional[int]:
+    payload = decode_jwt_payload(token)
+    exp = payload.get("exp")
+    if isinstance(exp, (int, float)):
+        return int(exp * 1000)
+    return None
+
+
+def build_codex_auth_profile(credentials: Dict[str, Any], profile_id: str = "openai-codex:default") -> Dict[str, Any]:
+    access = str(credentials.get("access") or credentials.get("access_token") or "").strip()
+    refresh = str(credentials.get("refresh") or credentials.get("refresh_token") or "").strip()
+    if not access:
+        raise RelayError("codex credentials missing access token")
+    if not refresh:
+        raise RelayError("codex credentials missing refresh token")
+    account_id = str(credentials.get("accountId") or credentials.get("account_id") or "").strip()
+    if not account_id:
+        account_id = extract_account_id_from_access_token(access)
+    expires = coerce_epoch_ms(credentials.get("expires"))
+    if expires is None:
+        expires_in = credentials.get("expires_in")
+        if isinstance(expires_in, (int, float)):
+            expires = int(time.time() * 1000 + float(expires_in) * 1000)
+    if expires is None:
+        expires = extract_expires_ms_from_access_token(access)
+    email = str(credentials.get("email") or "").strip() or (extract_email_from_access_token(access) or "")
+    profile: Dict[str, Any] = {
+        "type": "oauth",
+        "provider": "openai-codex",
+        "access": access,
+        "refresh": refresh,
+        "expires": expires,
+        "accountId": account_id,
+    }
+    if email:
+        profile["email"] = email
+    return {
+        "version": 1,
+        "profiles": {
+            profile_id: profile,
+        },
+    }
+
+
+def normalize_auth_store_payload(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict) and isinstance(raw.get("profiles"), dict):
+        normalized_profiles: Dict[str, Any] = {}
+        for profile_id, profile in raw.get("profiles", {}).items():
+            if not isinstance(profile, dict):
+                continue
+            if str(profile.get("provider") or "") != "openai-codex":
+                continue
+            normalized = build_codex_auth_profile(profile, profile_id=str(profile_id))
+            normalized_profiles.update(normalized["profiles"])
+        if normalized_profiles:
+            return {"version": int(raw.get("version", 1) or 1), "profiles": normalized_profiles}
+
+    if isinstance(raw, dict) and isinstance(raw.get("oauth"), dict):
+        oauth = raw.get("oauth") or {}
+        if isinstance(oauth.get("openai-codex"), dict):
+            return build_codex_auth_profile(oauth.get("openai-codex") or {}, profile_id="openai-codex:default")
+
+    if isinstance(raw, dict) and (raw.get("provider") == "openai-codex" or raw.get("access") or raw.get("access_token")):
+        return build_codex_auth_profile(raw, profile_id="openai-codex:default")
+
+    raise RelayError("auth payload tidak kompatibel untuk provider openai-codex")
+
+
+def write_auth_store(path: Path, payload: Dict[str, Any]) -> None:
+    ensure_dir(path.parent)
+    save_json(path, normalize_auth_store_payload(payload))
 
 
 def extract_codex_profile_info(auth_path: Path) -> Dict[str, Any]:
-    auth = load_json(auth_path, {})
+    auth = normalize_auth_store_payload(load_json(auth_path, {}))
     for profile_id, profile in (auth.get("profiles") or {}).items():
         if profile.get("provider") == "openai-codex":
+            access = str(profile.get("access") or "").strip()
+            account_id = str(profile.get("accountId") or "").strip() or (extract_account_id_from_access_token(access) if access else None)
+            email = str(profile.get("email") or "").strip() or (extract_email_from_access_token(access) if access else None)
+            expires = coerce_epoch_ms(profile.get("expires"))
+            if expires is None and access:
+                expires = extract_expires_ms_from_access_token(access)
             return {
                 "profileId": profile_id,
-                "accountId": profile.get("accountId"),
-                "expires": profile.get("expires"),
+                "accountId": account_id,
+                "expires": expires,
+                "email": email,
             }
     raise RelayError(f"no openai-codex profile found in {auth_path}")
 
@@ -306,16 +450,35 @@ def ensure_slot_models(agent_dir: Path) -> None:
     ensure_dir(agent_dir)
     dest = agent_dir / "models.json"
     if dest.exists():
+        current = load_json(dest, {})
+        providers = current.get("providers") if isinstance(current.get("providers"), dict) else {}
+        if "openai-codex" not in providers:
+            providers["openai-codex"] = {
+                "baseUrl": DEFAULT_CODEX_BASE_URL,
+                "api": "openai-codex-responses",
+                "models": [],
+            }
+            current["providers"] = providers
+            save_json(dest, current)
         return
     if SOURCE_MODELS.exists():
         shutil.copy2(SOURCE_MODELS, dest)
+        ensure_slot_models(agent_dir)
         return
-    save_json(dest, {"providers": {}})
+    save_json(dest, {
+        "providers": {
+            "openai-codex": {
+                "baseUrl": DEFAULT_CODEX_BASE_URL,
+                "api": "openai-codex-responses",
+                "models": [],
+            }
+        }
+    })
 
 
-def relay_profile_agent_dir(profile: str, runtime_root: Optional[Path] = None) -> Path:
-    agent_id = "relay"
-    if runtime_root:
+def relay_profile_agent_dir(profile: str, runtime_root: Optional[Path] = None, source_agent: Optional[str] = None) -> Path:
+    agent_id = source_agent or "relay"
+    if runtime_root and not source_agent:
         try:
             cfg = load_json(runtime_config_path(runtime_root), {})
             agent_id = str(cfg.get("runner", {}).get("agentId", "relay"))
@@ -324,16 +487,16 @@ def relay_profile_agent_dir(profile: str, runtime_root: Optional[Path] = None) -
     return Path.home() / f".openclaw-{profile}" / "agents" / agent_id / "agent"
 
 
-def copy_profile_auth_into_slot(runtime_root: Path, profile: str, slot_id: str) -> Optional[Path]:
+def copy_profile_auth_into_slot(runtime_root: Path, profile: str, slot_id: str, *, source_agent: Optional[str] = None) -> Optional[Path]:
     slot_id = normalize_slot_id(slot_id)
-    source_agent = relay_profile_agent_dir(profile, runtime_root=runtime_root)
-    source_auth = source_agent / "auth-profiles.json"
+    source_agent_dir = relay_profile_agent_dir(profile, runtime_root=runtime_root, source_agent=source_agent)
+    source_auth = source_agent_dir / "auth-profiles.json"
     if not source_auth.exists():
         return None
     target_agent = slot_agent_dir(runtime_root, slot_id)
     ensure_dir(target_agent)
-    shutil.copy2(source_auth, target_agent / "auth-profiles.json")
-    source_models = source_agent / "models.json"
+    write_auth_store(target_agent / "auth-profiles.json", load_json(source_auth, {}))
+    source_models = source_agent_dir / "models.json"
     if source_models.exists():
         shutil.copy2(source_models, target_agent / "models.json")
     else:
@@ -358,11 +521,12 @@ def upsert_slot_record(
     ensure_slot_models(agent_dir)
     info = extract_codex_profile_info(auth_file)
     provider_models = load_json(agent_dir / "models.json", {}).get("providers", {})
+    resolved_label = label or info.get("email") or slot_id
     return {
         "id": slot_id,
         "sourceSlot": source_slot,
         "enabled": enabled,
-        "label": label or slot_id,
+        "label": resolved_label,
         "agentDir": str(agent_dir),
         "authFile": str(auth_file),
         "modelDefault": model_default,
@@ -374,15 +538,39 @@ def upsert_slot_record(
             "consecutiveFailures": 0,
         },
         "sourceMeta": {
-            "emailLabel": label or slot_id,
+            "emailLabel": resolved_label,
             "accountId": info.get("accountId"),
             "profileId": info.get("profileId"),
             "expires": info.get("expires"),
+            "email": info.get("email"),
             "savedAt": utc_now_iso(),
             "usageFingerprint": usage_fingerprint(usage),
         },
         "providerModels": provider_models,
     }
+
+
+def save_slot_record(runtime_root: Path, record: Dict[str, Any]) -> Dict[str, Any]:
+    store = SlotStore(runtime_root)
+    slots = store.load_slots()
+    replaced = False
+    for idx, item in enumerate(slots):
+        if item.get("id") == record.get("id"):
+            slots[idx] = record
+            replaced = True
+            break
+    if not replaced:
+        slots.append(record)
+    store.save_slots(sorted(slots, key=lambda item: item.get("id", "")))
+    return record
+
+
+def get_slot_by_id(runtime_root: Path, slot_id: str) -> Dict[str, Any]:
+    target_slot = normalize_slot_id(slot_id)
+    for item in SlotStore(runtime_root).load_slots():
+        if item.get("id") == target_slot:
+            return item
+    raise RelayError(f"slot not found: {target_slot}")
 
 
 class SlotStore:
@@ -451,9 +639,13 @@ def sync_slots(runtime_root: Path) -> List[Dict[str, Any]]:
             raise FileNotFoundError(f"slot auth missing: {src_auth}")
 
         dest_auth = agent_dir / "auth-profiles.json"
-        shutil.copy2(src_auth, dest_auth)
-        shutil.copy2(SOURCE_MODELS, agent_dir / "models.json")
+        write_auth_store(dest_auth, load_json(src_auth, {}))
+        if SOURCE_MODELS.exists():
+            shutil.copy2(SOURCE_MODELS, agent_dir / "models.json")
+        else:
+            ensure_slot_models(agent_dir)
 
+        auth_info = extract_codex_profile_info(dest_auth)
         prev = existing.get(slot_id, {})
         slot = {
             "id": slot_id,
@@ -477,11 +669,12 @@ def sync_slots(runtime_root: Path) -> List[Dict[str, Any]]:
                 "consecutiveFailures": prev.get("runtime", {}).get("consecutiveFailures", 0)
             },
             "sourceMeta": {
-                "emailLabel": info.get("emailLabel"),
-                "accountId": info.get("accountId"),
-                "profileId": info.get("profileId"),
-                "expires": info.get("expires"),
-                "savedAt": info.get("savedAt"),
+                "emailLabel": info.get("emailLabel") or auth_info.get("email") or slot_id,
+                "accountId": info.get("accountId") or auth_info.get("accountId"),
+                "profileId": info.get("profileId") or auth_info.get("profileId"),
+                "expires": info.get("expires") or auth_info.get("expires"),
+                "email": auth_info.get("email"),
+                "savedAt": info.get("savedAt") or utc_now_iso(),
                 "usageFingerprint": info.get("usageFingerprint", "")
             },
             "providerModels": models_json.get("providers", {})
@@ -507,7 +700,7 @@ def run_interactive_subprocess(command: List[str], env: Optional[Dict[str, str]]
     return int(proc.returncode or 0)
 
 
-def fetch_slot_usage(agent_dir: str, profile: str) -> Dict[str, Any]:
+def fetch_slot_usage_openclaw(agent_dir: str, profile: str) -> Dict[str, Any]:
     env = {
         "OPENCLAW_AGENT_DIR": agent_dir,
         "OPENCLAW_HIDE_BANNER": "1",
@@ -521,21 +714,73 @@ def fetch_slot_usage(agent_dir: str, profile: str) -> Dict[str, Any]:
     return parse_usage_output(proc.stdout)
 
 
-def refresh_usage(runtime_root: Path, profile: str, slot_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-    assert_supported_backend(runtime_root, "usage", {"openclaw"}, purpose="usage")
-    store = SlotStore(runtime_root)
-    slots = store.load_slots()
-    changed: List[Dict[str, Any]] = []
-    slot_filter = normalize_slot_id(slot_filter) if slot_filter else None
-    for slot in slots:
-        if slot_filter and slot["id"] != slot_filter:
-            continue
-        usage = fetch_slot_usage(slot["agentDir"], profile)
-        slot["usage"] = usage
-        slot.setdefault("sourceMeta", {})["usageFingerprint"] = usage_fingerprint(usage)
-        changed.append({"id": slot["id"], **usage})
-    store.save_slots(slots)
-    return changed
+def format_duration_compact(total_seconds: Any) -> str:
+    seconds = max(0, int(float(total_seconds or 0)))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: List[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes and len(parts) < 2:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts[:2])
+
+
+def build_usage_line(left_pct: int, reset_after_seconds: Any) -> str:
+    return f"{max(0, min(100, int(left_pct)))}% left · resets {format_duration_compact(reset_after_seconds)}"
+
+
+def parse_codex_usage_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    rate_limit = data.get("rate_limit") if isinstance(data.get("rate_limit"), dict) else {}
+    primary = rate_limit.get("primary_window") if isinstance(rate_limit.get("primary_window"), dict) else {}
+    secondary = rate_limit.get("secondary_window") if isinstance(rate_limit.get("secondary_window"), dict) else {}
+
+    primary_left = max(0, 100 - int(primary.get("used_percent", 0) or 0)) if primary else -1
+    secondary_left = max(0, 100 - int(secondary.get("used_percent", 0) or 0)) if secondary else primary_left
+
+    usage5h = build_usage_line(primary_left, primary.get("reset_after_seconds", 0)) if primary else ""
+    usage_week = build_usage_line(secondary_left, secondary.get("reset_after_seconds", primary.get("reset_after_seconds", 0) if primary else 0)) if secondary_left >= 0 else ""
+
+    return {
+        "usage5h": usage5h,
+        "usageWeek": usage_week,
+        "fivePct": primary_left,
+        "weekPct": secondary_left,
+        "checkedAt": utc_now_iso(),
+    }
+
+
+def fetch_codex_usage_json(auth: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {auth['accessToken']}",
+        "User-Agent": "CodexBar",
+        "Accept": "application/json",
+    }
+    account_id = str(auth.get("accountId") or "").strip()
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    request = urllib.request.Request(DEFAULT_CODEX_USAGE_URL, headers=headers, method="GET")
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_slot_usage_codex_api(slot: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
+    try:
+        auth = load_slot_codex_auth(slot)
+        data = fetch_codex_usage_json(auth, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        if exc.code in {401, 403}:
+            auth = refresh_slot_codex_auth(slot, force=True)
+            data = fetch_codex_usage_json(auth, timeout=timeout)
+        else:
+            raise RelayError(body or f"codex usage http {exc.code}")
+    return parse_codex_usage_data(data)
 
 
 def blank_usage() -> Dict[str, Any]:
@@ -548,61 +793,161 @@ def blank_usage() -> Dict[str, Any]:
     }
 
 
-def login_slot(runtime_root: Path, profile: str, slot_id: str, label: str) -> Dict[str, Any]:
-    assert_supported_backend(runtime_root, "auth", {"openclaw"}, purpose="auth")
-    setup_runtime(runtime_root, profile)
-    slot_id = normalize_slot_id(slot_id)
-    agent_dir = slot_agent_dir(runtime_root, slot_id)
-    ensure_dir(agent_dir)
-    ensure_slot_models(agent_dir)
+def resolve_slot_usage(runtime_root: Path, profile: str, slot: Dict[str, Any]) -> Dict[str, Any]:
+    backend = assert_supported_backend(runtime_root, "usage", purpose="usage")
+    if backend == "openclaw":
+        return fetch_slot_usage_openclaw(slot["agentDir"], profile)
+    if backend == "codex-api":
+        return fetch_slot_usage_codex_api(slot)
+    if backend == "local-cache":
+        usage = json.loads(json.dumps(slot.get("usage") or blank_usage()))
+        usage.setdefault("checkedAt", utc_now_iso())
+        return usage
+    raise RelayError(f"usage backend '{backend}' belum didukung")
 
-    env = {
-        "OPENCLAW_AGENT_DIR": str(agent_dir),
-        "OPENCLAW_HIDE_BANNER": "1",
-        "OPENCLAW_SUPPRESS_NOTES": "1",
-    }
-    command = ["openclaw", "--profile", profile, "models", "auth", "login", "--provider", "openai-codex"]
-    code = run_interactive_subprocess(command, env=env, cwd=str(minimal_workspace_path(runtime_root)))
-    if code != 0:
-        raise RelayError(f"slot login gagal untuk {slot_id} (exit {code})")
 
-    auth_file = agent_dir / "auth-profiles.json"
-    if not auth_file.exists():
-        copied = copy_profile_auth_into_slot(runtime_root, profile, slot_id)
-        if copied:
-            auth_file = copied
-    if not auth_file.exists():
-        raise RelayError(f"auth file tidak ditemukan setelah login: {auth_file}")
-
-    try:
-        usage = fetch_slot_usage(str(agent_dir), profile)
-    except Exception:
-        usage = blank_usage()
-
+def refresh_usage(runtime_root: Path, profile: str, slot_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    assert_supported_backend(runtime_root, "usage", purpose="usage")
     store = SlotStore(runtime_root)
     slots = store.load_slots()
-    prev = next((item for item in slots if item["id"] == slot_id), {})
+    changed: List[Dict[str, Any]] = []
+    slot_filter = normalize_slot_id(slot_filter) if slot_filter else None
+    for slot in slots:
+        if slot_filter and slot["id"] != slot_filter:
+            continue
+        usage = resolve_slot_usage(runtime_root, profile, slot)
+        slot["usage"] = usage
+        slot.setdefault("sourceMeta", {})["usageFingerprint"] = usage_fingerprint(usage)
+        changed.append({"id": slot["id"], **usage})
+    store.save_slots(slots)
+    return changed
+
+
+def build_provisional_slot(runtime_root: Path, slot_id: str, prev: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    prev = prev or {}
+    slot_id = normalize_slot_id(slot_id)
+    agent_dir = slot_agent_dir(runtime_root, slot_id)
+    return {
+        "id": slot_id,
+        "agentDir": str(agent_dir),
+        "authFile": str(agent_dir / "auth-profiles.json"),
+        "modelDefault": prev.get("modelDefault", "gpt-5.4"),
+        "usage": prev.get("usage") or blank_usage(),
+    }
+
+
+def finalize_slot_registration(runtime_root: Path, profile: str, slot_id: str, label: str, *, source_slot: Optional[str] = None) -> Dict[str, Any]:
+    target_slot = normalize_slot_id(slot_id)
+    existing_slots = SlotStore(runtime_root).load_slots()
+    prev = next((item for item in existing_slots if item.get("id") == target_slot), {})
+    provisional = build_provisional_slot(runtime_root, target_slot, prev=prev)
+    try:
+        usage = resolve_slot_usage(runtime_root, profile, provisional)
+    except Exception:
+        usage = prev.get("usage") or blank_usage()
     record = upsert_slot_record(
         runtime_root,
-        slot_id,
+        target_slot,
         label,
         usage,
         enabled=prev.get("enabled", True),
         model_default=prev.get("modelDefault", "gpt-5.4"),
         runtime_meta=prev.get("runtime"),
-        source_slot=prev.get("sourceSlot"),
+        source_slot=source_slot if source_slot is not None else prev.get("sourceSlot"),
     )
-    replaced = False
-    for idx, item in enumerate(slots):
-        if item["id"] == slot_id:
-            slots[idx] = record
-            replaced = True
-            break
-    if not replaced:
-        slots.append(record)
-    slots = sorted(slots, key=lambda item: item["id"])
-    store.save_slots(slots)
-    return record
+    return save_slot_record(runtime_root, record)
+
+
+def login_slot(runtime_root: Path, profile: str, slot_id: str, label: str) -> Dict[str, Any]:
+    backend = assert_supported_backend(runtime_root, "auth", purpose="auth")
+    setup_runtime(runtime_root, profile)
+    slot_id = normalize_slot_id(slot_id)
+    agent_dir = slot_agent_dir(runtime_root, slot_id)
+    ensure_dir(agent_dir)
+    ensure_slot_models(agent_dir)
+    auth_file = agent_dir / "auth-profiles.json"
+
+    if backend == "openclaw":
+        env = {
+            "OPENCLAW_AGENT_DIR": str(agent_dir),
+            "OPENCLAW_HIDE_BANNER": "1",
+            "OPENCLAW_SUPPRESS_NOTES": "1",
+        }
+        command = ["openclaw", "--profile", profile, "models", "auth", "login", "--provider", "openai-codex"]
+        code = run_interactive_subprocess(command, env=env, cwd=str(minimal_workspace_path(runtime_root)))
+        if code != 0:
+            raise RelayError(f"slot login gagal untuk {slot_id} (exit {code})")
+        if not auth_file.exists():
+            copied = copy_profile_auth_into_slot(runtime_root, profile, slot_id)
+            if copied:
+                auth_file = copied
+        if not auth_file.exists():
+            raise RelayError(f"auth file tidak ditemukan setelah login: {auth_file}")
+    elif backend == "native":
+        credentials = login_openai_codex_native()
+        write_auth_store(auth_file, build_codex_auth_profile(credentials))
+    else:
+        raise RelayError(f"auth backend '{backend}' belum didukung")
+
+    return finalize_slot_registration(runtime_root, profile, slot_id, label)
+
+
+def slot_auth_import_file(runtime_root: Path, profile: str, slot_id: str, label: str, auth_file: Path) -> Dict[str, Any]:
+    setup_runtime(runtime_root, profile)
+    slot_id = normalize_slot_id(slot_id)
+    agent_dir = slot_agent_dir(runtime_root, slot_id)
+    ensure_dir(agent_dir)
+    ensure_slot_models(agent_dir)
+    if not auth_file.exists():
+        raise RelayError(f"auth file tidak ditemukan: {auth_file}")
+    write_auth_store(agent_dir / "auth-profiles.json", load_json(auth_file, {}))
+    return finalize_slot_registration(runtime_root, profile, slot_id, label)
+
+
+def slot_auth_copy_profile(runtime_root: Path, profile: str, slot_id: str, label: str, source_profile: str, *, source_agent: Optional[str] = None) -> Dict[str, Any]:
+    setup_runtime(runtime_root, profile)
+    copied = copy_profile_auth_into_slot(runtime_root, source_profile, slot_id, source_agent=source_agent)
+    if not copied:
+        raise RelayError(f"auth file tidak ditemukan di profile sumber: {source_profile}")
+    return finalize_slot_registration(runtime_root, profile, slot_id, label)
+
+
+def slot_usage_set(runtime_root: Path, slot_id: str, usage5h: str, usageWeek: str) -> Dict[str, Any]:
+    slot = get_slot_by_id(runtime_root, slot_id)
+    usage = {
+        "usage5h": usage5h,
+        "usageWeek": usageWeek,
+        "fivePct": parse_pct(usage5h),
+        "weekPct": parse_pct(usageWeek),
+        "checkedAt": utc_now_iso(),
+    }
+    slot["usage"] = usage
+    slot.setdefault("sourceMeta", {})["usageFingerprint"] = usage_fingerprint(usage)
+    return save_slot_record(runtime_root, slot)
+
+
+def slot_usage_copy_main(runtime_root: Path, slot_id: str) -> Dict[str, Any]:
+    slot = get_slot_by_id(runtime_root, slot_id)
+    source_slots = load_source_slots().get("slots", {})
+    fallback_lookup = ""
+    normalized = normalize_slot_id(slot_id)
+    if "-" in normalized:
+        fallback_lookup = normalized.split("-", 1)[1]
+    lookup = str(slot.get("sourceSlot") or fallback_lookup)
+    info = source_slots.get(lookup)
+    if not isinstance(info, dict):
+        raise RelayError(f"source usage metadata tidak ditemukan untuk slot {lookup}")
+    usage = {
+        "usage5h": info.get("usage5h", ""),
+        "usageWeek": info.get("usageWeek", ""),
+        "fivePct": parse_pct(info.get("usage5h", "")),
+        "weekPct": parse_pct(info.get("usageWeek", "")),
+        "checkedAt": info.get("liveCheckedAt") or slot.get("usage", {}).get("checkedAt") or utc_now_iso(),
+    }
+    slot["usage"] = usage
+    slot["sourceSlot"] = lookup
+    slot.setdefault("sourceMeta", {})["usageFingerprint"] = usage_fingerprint(usage)
+    return save_slot_record(runtime_root, slot)
 
 
 def list_slots(runtime_root: Path) -> List[Dict[str, Any]]:
@@ -772,6 +1117,188 @@ def parse_json_from_mixed_output(raw: str) -> Dict[str, Any]:
     raise RelayError(f"failed to parse JSON object from output: {text[:500]}")
 
 
+def build_openai_oauth_auth_url(verifier: str, state: str, originator: str = OPENAI_CODEX_ORIGINATOR) -> str:
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("utf-8")).digest()).decode("utf-8").rstrip("=")
+    params = {
+        "response_type": "code",
+        "client_id": OPENAI_CODEX_CLIENT_ID,
+        "redirect_uri": OPENAI_CODEX_REDIRECT_URI,
+        "scope": OPENAI_CODEX_SCOPE,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
+        "originator": originator,
+    }
+    return f"{OPENAI_CODEX_AUTHORIZE_URL}?{urlencode(params)}"
+
+
+def parse_authorization_input(raw_input: str) -> Dict[str, Optional[str]]:
+    value = str(raw_input or "").strip()
+    if not value:
+        return {"code": None, "state": None}
+
+    try:
+        parsed = urlparse(value)
+        query = parse_qs(parsed.query or "")
+        code = (query.get("code") or [None])[0]
+        state = (query.get("state") or [None])[0]
+        if code:
+            return {"code": str(code), "state": str(state) if state else None}
+    except Exception:
+        pass
+
+    if "code=" in value:
+        query = parse_qs(value)
+        code = (query.get("code") or [None])[0]
+        state = (query.get("state") or [None])[0]
+        return {"code": str(code) if code else None, "state": str(state) if state else None}
+
+    if "#" in value and "http" not in value:
+        code, _, state = value.partition("#")
+        return {"code": code.strip() or None, "state": state.strip() or None}
+
+    return {"code": value, "state": None}
+
+
+def post_openai_oauth_token(payload: Dict[str, str], timeout: int = 60) -> Dict[str, Any]:
+    request = urllib.request.Request(
+        OPENAI_CODEX_TOKEN_URL,
+        data=urlencode(payload).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RelayError(f"oauth token request failed ({exc.code}): {body[:500]}")
+
+
+def exchange_openai_authorization_code(code: str, verifier: str) -> Dict[str, Any]:
+    data = post_openai_oauth_token({
+        "grant_type": "authorization_code",
+        "client_id": OPENAI_CODEX_CLIENT_ID,
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": OPENAI_CODEX_REDIRECT_URI,
+    })
+    if not data.get("access_token") or not data.get("refresh_token") or not isinstance(data.get("expires_in"), (int, float)):
+        raise RelayError("oauth token response missing required fields")
+    return {
+        "access": str(data.get("access_token")),
+        "refresh": str(data.get("refresh_token")),
+        "expires": int(time.time() * 1000 + float(data.get("expires_in")) * 1000),
+        "accountId": extract_account_id_from_access_token(str(data.get("access_token"))),
+        "email": extract_email_from_access_token(str(data.get("access_token"))),
+    }
+
+
+def refresh_openai_codex_token(refresh_token: str) -> Dict[str, Any]:
+    if not str(refresh_token or "").strip():
+        raise RelayError("refresh token kosong")
+    data = post_openai_oauth_token({
+        "grant_type": "refresh_token",
+        "refresh_token": str(refresh_token),
+        "client_id": OPENAI_CODEX_CLIENT_ID,
+    })
+    if not data.get("access_token") or not data.get("refresh_token") or not isinstance(data.get("expires_in"), (int, float)):
+        raise RelayError("oauth refresh response missing required fields")
+    access = str(data.get("access_token"))
+    return {
+        "access": access,
+        "refresh": str(data.get("refresh_token")),
+        "expires": int(time.time() * 1000 + float(data.get("expires_in")) * 1000),
+        "accountId": extract_account_id_from_access_token(access),
+        "email": extract_email_from_access_token(access),
+    }
+
+
+def login_openai_codex_native() -> Dict[str, Any]:
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).decode("utf-8").rstrip("=")
+    state = uuid.uuid4().hex
+    auth_url = build_openai_oauth_auth_url(verifier, state)
+
+    print("\nOpenAI Codex OAuth login (native)")
+    print("Buka URL berikut lalu login. Setelah redirect, paste URL callback atau code ke terminal.")
+    print(auth_url)
+
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+
+    user_input = input("Paste authorization code / redirect URL: ").strip()
+    parsed = parse_authorization_input(user_input)
+    code = parsed.get("code")
+    incoming_state = parsed.get("state")
+    if incoming_state and incoming_state != state:
+        raise RelayError("oauth state mismatch")
+    if not code:
+        raise RelayError("authorization code kosong")
+
+    return exchange_openai_authorization_code(str(code), verifier)
+
+
+def refresh_slot_codex_auth(slot: Dict[str, Any], *, force: bool = False, leeway_seconds: int = AUTH_REFRESH_LEEWAY_SECONDS) -> Dict[str, Any]:
+    auth_file = Path(slot.get("authFile") or Path(slot.get("agentDir", "")) / "auth-profiles.json")
+    auth_data = normalize_auth_store_payload(load_json(auth_file, {}))
+    preferred_profile = slot.get("sourceMeta", {}).get("profileId") if isinstance(slot.get("sourceMeta"), dict) else None
+    profile_id, profile = pick_openai_codex_profile(auth_data, preferred_id=preferred_profile)
+
+    expires_ms = coerce_epoch_ms(profile.get("expires"))
+    now_ms = int(time.time() * 1000)
+    should_refresh = force
+    if not should_refresh:
+        if expires_ms is None:
+            should_refresh = True
+        else:
+            should_refresh = now_ms + int(leeway_seconds * 1000) >= int(expires_ms)
+
+    if not should_refresh:
+        return {
+            "profileId": profile_id,
+            "accessToken": str(profile.get("access") or "").strip(),
+            "refreshToken": str(profile.get("refresh") or "").strip(),
+            "accountId": str(profile.get("accountId") or "").strip() or extract_account_id_from_access_token(str(profile.get("access") or "")),
+            "expires": expires_ms,
+            "email": str(profile.get("email") or "").strip() or extract_email_from_access_token(str(profile.get("access") or "")),
+        }
+
+    refreshed = refresh_openai_codex_token(str(profile.get("refresh") or ""))
+    merged = dict(profile)
+    merged.update({
+        "provider": "openai-codex",
+        "type": "oauth",
+        "access": refreshed["access"],
+        "refresh": refreshed["refresh"],
+        "expires": refreshed["expires"],
+        "accountId": refreshed["accountId"],
+    })
+    if refreshed.get("email"):
+        merged["email"] = refreshed.get("email")
+
+    auth_data.setdefault("profiles", {})
+    auth_data["profiles"][profile_id] = merged
+    write_auth_store(auth_file, auth_data)
+    if isinstance(slot.get("sourceMeta"), dict):
+        slot["sourceMeta"]["expires"] = refreshed["expires"]
+        slot["sourceMeta"]["accountId"] = refreshed["accountId"]
+        if refreshed.get("email"):
+            slot["sourceMeta"]["email"] = refreshed.get("email")
+
+    return {
+        "profileId": profile_id,
+        "accessToken": refreshed["access"],
+        "refreshToken": refreshed["refresh"],
+        "accountId": refreshed["accountId"],
+        "expires": refreshed["expires"],
+        "email": refreshed.get("email"),
+    }
+
+
 def normalize_model_for_codex(model: str) -> str:
     value = (model or "").strip()
     if not value:
@@ -832,23 +1359,33 @@ def pick_openai_codex_profile(auth: Dict[str, Any], preferred_id: Optional[str] 
     raise RelayError("no openai-codex profile found in slot auth file")
 
 
-def load_slot_codex_auth(slot: Dict[str, Any]) -> Dict[str, Any]:
+def load_slot_codex_auth(slot: Dict[str, Any], *, refresh_if_needed: bool = True) -> Dict[str, Any]:
     auth_file = Path(slot.get("authFile") or Path(slot.get("agentDir", "")) / "auth-profiles.json")
-    auth_data = load_json(auth_file, {})
+    auth_data = normalize_auth_store_payload(load_json(auth_file, {}))
     preferred_profile = slot.get("sourceMeta", {}).get("profileId") if isinstance(slot.get("sourceMeta"), dict) else None
     profile_id, profile = pick_openai_codex_profile(auth_data, preferred_id=preferred_profile)
     access_token = str(profile.get("access") or "").strip()
     if not access_token:
         raise RelayError(f"missing codex access token in {auth_file}")
+
+    expires_ms = coerce_epoch_ms(profile.get("expires"))
+    if refresh_if_needed:
+        now_ms = int(time.time() * 1000)
+        if expires_ms is None or now_ms + AUTH_REFRESH_LEEWAY_SECONDS * 1000 >= int(expires_ms):
+            return refresh_slot_codex_auth(slot, force=True)
+
     account_id = str(profile.get("accountId") or "").strip()
     if not account_id:
         account_id = extract_account_id_from_access_token(access_token)
+
+    email = str(profile.get("email") or "").strip() or extract_email_from_access_token(access_token)
     return {
         "profileId": profile_id,
         "accessToken": access_token,
         "refreshToken": str(profile.get("refresh") or "").strip(),
         "accountId": account_id,
-        "expires": profile.get("expires"),
+        "expires": expires_ms,
+        "email": email,
     }
 
 
@@ -1142,24 +1679,33 @@ def open_codex_stream_request(
     *,
     raise_retryable: bool = False,
 ):
-    auth = load_slot_codex_auth(slot)
     url = resolve_codex_responses_url(get_slot_codex_base_url(slot))
-    headers = build_codex_headers(auth, stream=True, session_key=session_key)
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        return urllib.request.urlopen(request, timeout=timeout)
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read()
-        if raise_retryable and should_retry_upstream_status(exc.code):
-            raise RetryableUpstreamError(exc.code, error_body, dict(exc.headers))
-        detail = error_body.decode("utf-8", errors="replace").strip()
-        message = detail or f"codex upstream http {exc.code}"
-        raise RelayError(message)
+    auth = load_slot_codex_auth(slot, refresh_if_needed=True)
+
+    for attempt in range(2):
+        headers = build_codex_headers(auth, stream=True, session_key=session_key)
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read()
+            if exc.code in {401, 403} and attempt == 0:
+                try:
+                    auth = refresh_slot_codex_auth(slot, force=True)
+                    continue
+                except Exception:
+                    pass
+            if raise_retryable and should_retry_upstream_status(exc.code):
+                raise RetryableUpstreamError(exc.code, error_body, dict(exc.headers))
+            detail = error_body.decode("utf-8", errors="replace").strip()
+            message = detail or f"codex upstream http {exc.code}"
+            raise RelayError(message)
+    raise RelayError("codex upstream auth retry exhausted")
 
 
 def run_slot_prompt_codex_direct(slot: Dict[str, Any], prompt: str, timeout: int, session_key: Optional[str] = None) -> Dict[str, Any]:
@@ -1810,7 +2356,7 @@ def normalize_responses_input_to_messages(payload: Dict[str, Any]) -> List[Dict[
 
 
 def get_runner_backend_from_config(config: Dict[str, Any]) -> str:
-    return str(config.get("runner", {}).get("backend", "openclaw") or "openclaw")
+    return str(config.get("runner", {}).get("backend", "codex-direct") or "codex-direct")
 
 
 def execute_relay_completion(server: "RelayServer", requested_model: str, prompt: str, source_messages: Optional[List[Dict[str, Any]]] = None) -> Tuple[str, str, Dict[str, Any]]:
@@ -2241,6 +2787,25 @@ def cmd_slot_login(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_slot_auth_import_file(args: argparse.Namespace) -> int:
+    slot = slot_auth_import_file(args.runtime_root, args.profile, args.slot, args.label, Path(args.auth_file))
+    print(json.dumps({"slot": slot}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_slot_auth_copy_profile(args: argparse.Namespace) -> int:
+    slot = slot_auth_copy_profile(
+        args.runtime_root,
+        args.profile,
+        args.slot,
+        args.label,
+        args.source_profile,
+        source_agent=args.source_agent,
+    )
+    print(json.dumps({"slot": slot}, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_slot_enable(args: argparse.Namespace) -> int:
     slot = set_slot_enabled(args.runtime_root, args.slot, True)
     print(json.dumps({"slot": slot}, indent=2, ensure_ascii=False))
@@ -2256,6 +2821,18 @@ def cmd_slot_disable(args: argparse.Namespace) -> int:
 def cmd_slot_remove(args: argparse.Namespace) -> int:
     slot = remove_slot(args.runtime_root, args.slot)
     print(json.dumps({"removed": {"id": slot.get("id"), "label": slot.get("label")}}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_slot_usage_set(args: argparse.Namespace) -> int:
+    slot = slot_usage_set(args.runtime_root, args.slot, args.usage5h, args.usageWeek)
+    print(json.dumps({"slot": slot}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_slot_usage_copy_main(args: argparse.Namespace) -> int:
+    slot = slot_usage_copy_main(args.runtime_root, args.slot)
+    print(json.dumps({"slot": slot}, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -2358,6 +2935,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_slot_login.add_argument("--label", required=True, help="Human label such as email/account name")
     p_slot_login.set_defaults(func=cmd_slot_login)
 
+    p_slot_auth_import = sub.add_parser("slot-auth-import-file", help="Import a compatible auth-profiles.json into one slot")
+    p_slot_auth_import.add_argument("--slot", required=True, help="Slot id or number, e.g. 2 or slot-2")
+    p_slot_auth_import.add_argument("--label", required=True, help="Human label such as email/account name")
+    p_slot_auth_import.add_argument("--auth-file", required=True, help="Path to source auth-profiles.json")
+    p_slot_auth_import.set_defaults(func=cmd_slot_auth_import_file)
+
+    p_slot_auth_copy = sub.add_parser("slot-auth-copy-profile", help="Copy Codex auth from another OpenClaw profile/agent into one slot")
+    p_slot_auth_copy.add_argument("--slot", required=True, help="Slot id or number, e.g. 2 or slot-2")
+    p_slot_auth_copy.add_argument("--label", required=True, help="Human label such as email/account name")
+    p_slot_auth_copy.add_argument("--source-profile", required=True, help="OpenClaw profile name, e.g. codex-slot-relay")
+    p_slot_auth_copy.add_argument("--source-agent", help="Optional source agent id (defaults to relay)")
+    p_slot_auth_copy.set_defaults(func=cmd_slot_auth_copy_profile)
+
     p_slot_enable = sub.add_parser("slot-enable", help="Enable one relay-managed slot for selection")
     p_slot_enable.add_argument("--slot", required=True, help="Slot id or number, e.g. 2 or slot-2")
     p_slot_enable.set_defaults(func=cmd_slot_enable)
@@ -2369,6 +2959,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_slot_remove = sub.add_parser("slot-remove", help="Remove one relay-managed slot and delete its relay-local auth/runtime state")
     p_slot_remove.add_argument("--slot", required=True, help="Slot id or number, e.g. 2 or slot-2")
     p_slot_remove.set_defaults(func=cmd_slot_remove)
+
+    p_slot_usage_set = sub.add_parser("slot-usage-set", help="Set slot usage snapshot manually (for local-cache workflow)")
+    p_slot_usage_set.add_argument("--slot", required=True, help="Slot id or number, e.g. 2 or slot-2")
+    p_slot_usage_set.add_argument("--usage5h", required=True, help="Primary window usage label")
+    p_slot_usage_set.add_argument("--usageWeek", required=True, help="Secondary window usage label")
+    p_slot_usage_set.set_defaults(func=cmd_slot_usage_set)
+
+    p_slot_usage_copy = sub.add_parser("slot-usage-copy-main", help="Copy usage snapshot for one slot from main slot metadata")
+    p_slot_usage_copy.add_argument("--slot", required=True, help="Slot id or number, e.g. 2 or slot-2")
+    p_slot_usage_copy.set_defaults(func=cmd_slot_usage_copy_main)
 
     p_refresh = sub.add_parser("refresh-usage", help="Refresh usage cache from all or one relay-managed slot")
     p_refresh.add_argument("--slot")

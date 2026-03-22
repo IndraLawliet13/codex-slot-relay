@@ -2,11 +2,14 @@
 
 ## Prerequisites
 
-Current safe mode expects:
+Standalone-first default needs:
 
 - Python 3.10+
-- `openclaw` installed and available in `PATH`
-- ability to complete Codex login interactively on this machine
+- ability to complete Codex OAuth login interactively (browser + paste callback/code)
+
+Optional only for bridge workflows:
+
+- `openclaw` in `PATH` (if using `slot-import-main` or OpenClaw backends)
 
 ## Install
 
@@ -18,33 +21,36 @@ pip install .
 
 ## Minimal local workflow
 
-### 1. Initialize runtime
+### 1) Initialize runtime
+
 ```bash
 codex-slot-relay init
 ```
 
-This prepares a local runtime under:
+Runtime root:
 - `.codex-slot-relay-runtime/`
 
-### 2. Login a slot
+### 2) Add first slot (native OAuth)
+
 ```bash
 codex-slot-relay slot-login --slot 1 --label your-email@example.com
 ```
 
-This stores the authenticated slot inside the relay runtime instead of depending on the main OpenClaw slot store.
+### 3) Verify slot and usage
 
-### 3. Inspect slot state
 ```bash
 codex-slot-relay slot-list
 codex-slot-relay refresh-usage
 ```
 
-### 4. Start the relay
+### 4) Start relay
+
 ```bash
 codex-slot-relay serve
 ```
 
-### 5. Smoke test the API
+### 5) Smoke-test API
+
 ```bash
 curl -sS -X POST http://127.0.0.1:8787/v1/chat/completions \
   -H 'Authorization: Bearer relay-dev-token' \
@@ -52,19 +58,35 @@ curl -sS -X POST http://127.0.0.1:8787/v1/chat/completions \
   --data '{"model":"relay-selftest","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-## Legacy bridge option
+## Optional bridge workflows
 
-If you already have saved Codex slots in a main OpenClaw state and want to import them:
+Import saved slots from main OpenClaw slot metadata:
 
 ```bash
 codex-slot-relay slot-import-main
 ```
 
-This is intentionally treated as a compatibility bridge, not the preferred future path.
+Import auth file directly into slot:
+
+```bash
+codex-slot-relay slot-auth-import-file \
+  --slot 2 \
+  --label imported@example.com \
+  --auth-file /path/to/auth-profiles.json
+```
+
+Copy auth from OpenClaw profile:
+
+```bash
+codex-slot-relay slot-auth-copy-profile \
+  --slot 3 \
+  --label copied@example.com \
+  --source-profile codex-slot-relay
+```
 
 ## Pairing with codex-utils
 
-If `codex-utils` is installed with its local defaults, you can immediately use:
+With default local settings in `codex-utils`:
 
 ```python
 from codex_utils import CodexClient
@@ -73,6 +95,6 @@ client = CodexClient()
 print(client.ask("Balas satu kata saja: halo"))
 ```
 
-As long as the relay is running on:
+As long as relay is running on:
 - `http://127.0.0.1:8787/v1`
 - token `relay-dev-token`
