@@ -37,6 +37,13 @@ This is intentional because it provides a stable stepping stone:
 - easier to showcase now
 - easier to replace later with a more ambitious runner
 
+The first ambitious-mode step is already reflected in code/config:
+- `auth.backend`
+- `usage.backend`
+- `runner.backend`
+
+So the remaining OpenClaw dependency is now explicit and localized instead of being hidden implicitly.
+
 ## Slot sources
 
 ### Preferred path

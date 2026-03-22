@@ -16,7 +16,14 @@
     "genericErrorSeconds": 300,
     "quotaErrorSeconds": 1800
   },
+  "auth": {
+    "backend": "openclaw"
+  },
+  "usage": {
+    "backend": "openclaw"
+  },
   "runner": {
+    "backend": "openclaw",
     "agentId": "relay"
   }
 }

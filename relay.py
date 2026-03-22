@@ -221,6 +221,45 @@ def make_profile_config(runtime_root: Path, profile: str, workspace: Optional[Pa
     }
 
 
+def get_backend_name(runtime_root: Path, section: str, default: str = "openclaw") -> str:
+    cfg = load_json(runtime_config_path(runtime_root), {})
+    return str(cfg.get(section, {}).get("backend", default))
+
+
+def assert_supported_backend(runtime_root: Path, section: str, supported: Iterable[str], *, purpose: str) -> str:
+    backend = get_backend_name(runtime_root, section)
+    if backend not in supported:
+        supported_text = ", ".join(sorted(set(supported)))
+        raise RelayError(f"{purpose} backend '{backend}' belum didukung. backend yang tersedia saat ini: {supported_text}")
+    return backend
+
+
+def dependency_map(runtime_root: Path) -> Dict[str, Any]:
+    cfg = load_json(runtime_config_path(runtime_root), {})
+    return {
+        "auth": {
+            "backend": get_backend_name(runtime_root, "auth"),
+            "status": "OpenClaw-dependent" if get_backend_name(runtime_root, "auth") == "openclaw" else "custom",
+            "usedBy": ["slot-login"],
+        },
+        "usage": {
+            "backend": get_backend_name(runtime_root, "usage"),
+            "status": "OpenClaw-dependent" if get_backend_name(runtime_root, "usage") == "openclaw" else "custom",
+            "usedBy": ["refresh-usage", "slot-login"],
+        },
+        "runner": {
+            "backend": get_backend_name(runtime_root, "runner"),
+            "status": "OpenClaw-dependent" if get_backend_name(runtime_root, "runner") == "openclaw" else "custom",
+            "usedBy": ["test-runner", "serve"],
+        },
+        "stateControlPlane": {
+            "backend": "local-runtime",
+            "status": "OpenClaw-independent",
+            "usedBy": ["init", "slot-list", "slot-enable", "slot-disable", "slot-remove"],
+        },
+    }
+
+
 def setup_runtime(runtime_root: Path, profile: str, force: bool = False) -> None:
     ensure_dir(runtime_root / "config")
     ensure_dir(runtime_root / "state" / "slots")
@@ -470,6 +509,7 @@ def fetch_slot_usage(agent_dir: str, profile: str) -> Dict[str, Any]:
 
 
 def refresh_usage(runtime_root: Path, profile: str, slot_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    assert_supported_backend(runtime_root, "usage", {"openclaw"}, purpose="usage")
     store = SlotStore(runtime_root)
     slots = store.load_slots()
     changed: List[Dict[str, Any]] = []
@@ -496,6 +536,7 @@ def blank_usage() -> Dict[str, Any]:
 
 
 def login_slot(runtime_root: Path, profile: str, slot_id: str, label: str) -> Dict[str, Any]:
+    assert_supported_backend(runtime_root, "auth", {"openclaw"}, purpose="auth")
     setup_runtime(runtime_root, profile)
     slot_id = normalize_slot_id(slot_id)
     agent_dir = slot_agent_dir(runtime_root, slot_id)
@@ -772,6 +813,7 @@ def wait_for_gateway_http(port: int, timeout_seconds: int = 20) -> None:
 
 
 def start_slot_gateway(slot: Dict[str, Any], profile: str, runtime_root: Path) -> Dict[str, Any]:
+    assert_supported_backend(runtime_root, "runner", {"openclaw"}, purpose="runner")
     request_runtime = build_request_runtime(slot, runtime_root, profile)
     token = f"relay-gateway-{uuid.uuid4().hex}"
     port = find_free_loopback_port()
@@ -1628,6 +1670,12 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dependency_map(args: argparse.Namespace) -> int:
+    setup_runtime(args.runtime_root, args.profile)
+    print(json.dumps({"dependencyMap": dependency_map(args.runtime_root)}, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_health(args: argparse.Namespace) -> int:
     config = load_json(runtime_config_path(args.runtime_root))
     slots = SlotStore(args.runtime_root).load_slots()
@@ -1717,6 +1765,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_refresh = sub.add_parser("refresh-usage", help="Refresh usage cache from all or one relay-managed slot")
     p_refresh.add_argument("--slot")
     p_refresh.set_defaults(func=cmd_refresh_usage)
+
+    p_dep = sub.add_parser("dependency-map", help="Show which relay subsystems still depend on which backend")
+    p_dep.set_defaults(func=cmd_dependency_map)
 
     p_health = sub.add_parser("health", help="Print current relay runtime health JSON")
     p_health.set_defaults(func=cmd_health)

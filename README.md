@@ -113,6 +113,7 @@ Main commands:
 - `codex-slot-relay slot-remove --slot 2`
 - `codex-slot-relay refresh-usage`
 - `codex-slot-relay slot-import-main`
+- `codex-slot-relay dependency-map`
 - `codex-slot-relay test-runner --slot slot-2 --prompt "Reply with exactly pong"`
 - `codex-slot-relay serve`
 
