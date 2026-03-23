@@ -34,6 +34,7 @@ MAIN_OPENCLAW_CONFIG = Path(os.getenv("OPENCLAW_MAIN_CONFIG", str(OPENCLAW_HOME 
 RUNTIME_CONFIG_REL = Path("config/relay.json")
 RUNTIME_SLOTS_REL = Path("config/slots.json")
 MIN_WORKSPACE_NAME = "min-workspace"
+LEGACY_AUTH_TOKENS = ["relay-dev-token", "relay-internal-token"]
 MIN_WORKSPACE_AGENTS = """# AGENTS.md - Codex Slot Relay Minimal Workspace
 
 Stateless relay worker.
@@ -1596,9 +1597,6 @@ def translate_chat_completions_to_codex_payload(body: Dict[str, Any], model_hint
         "tool_choice": "auto",
         "parallel_tool_calls": True,
     }
-    temperature = body.get("temperature")
-    if isinstance(temperature, (int, float)):
-        payload["temperature"] = float(temperature)
     if session_key:
         payload["prompt_cache_key"] = session_key
     return payload
@@ -1630,7 +1628,7 @@ def translate_responses_to_codex_payload(body: Dict[str, Any], model_hint: str, 
         "tool_choice": "auto",
         "parallel_tool_calls": True,
     }
-    for key in ("temperature", "max_output_tokens", "reasoning", "tools", "tool_choice", "parallel_tool_calls", "metadata"):
+    for key in ("max_output_tokens", "reasoning", "tools", "tool_choice", "parallel_tool_calls", "metadata"):
         if key in body:
             payload[key] = body[key]
 
@@ -2597,9 +2595,15 @@ class RelayHandler(BaseHTTPRequestHandler):
             raise RelayError(f"invalid JSON body: {exc}") from exc
 
     def _check_auth(self) -> bool:
-        expected = self.server.relay_config["authToken"]
+        expected = str(self.server.relay_config["authToken"])
+        accepted = {expected}
+        if expected in LEGACY_AUTH_TOKENS:
+            accepted.update(LEGACY_AUTH_TOKENS)
+        extra = self.server.relay_config.get("authTokenAliases") or []
+        if isinstance(extra, list):
+            accepted.update(str(item) for item in extra if str(item).strip())
         header = self.headers.get("Authorization", "")
-        return header == f"Bearer {expected}"
+        return header in {f"Bearer {token}" for token in accepted}
 
     def _set_sse_headers(self) -> None:
         self._ensure_request_context()
