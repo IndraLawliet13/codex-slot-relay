@@ -30,6 +30,18 @@ With built-in slot selection and automatic rolling to the best available account
   - `POST /v1/responses`
 - SSE streaming for both API styles
 - slot-aware routing based on usage + cooldown + health
+- structured JSON request logging with request-id and slot-id tracing headers
+- built-in admin/observability endpoints
+  - `GET /healthz`
+  - `GET /admin/slots`
+  - `GET /admin/stats`
+  - `GET /admin/dependency-map`
+  - `GET /admin/config`
+  - `POST /admin/refresh-usage`
+- configurable slot selection policy
+  - `best-week-then-5h` (default)
+  - `best-5h-then-week`
+  - `least-recently-used`
 - relay-managed slot lifecycle
   - native login (`slot-login`)
   - auth import/copy (`slot-auth-import-file`, `slot-auth-copy-profile`)
@@ -94,6 +106,7 @@ Quick sanity check:
 
 ```bash
 curl -sS http://127.0.0.1:8787/healthz
+curl -sS http://127.0.0.1:8787/admin/stats -H 'Authorization: Bearer relay-dev-token'
 ```
 
 Default local API target:
@@ -157,6 +170,10 @@ Main commands:
 - Relay is stateless by design.
 - `/v1/chat/completions` on `codex-direct` is translated over Codex Responses API.
 - `tools` on `chat/completions` path is intentionally limited in current version.
+- Every HTTP response now includes lightweight tracing headers:
+  - `X-Relay-Version`
+  - `X-Relay-Request-Id`
+  - `X-Relay-Slot-Id` (when a slot-backed request is selected)
 
 ## License
 

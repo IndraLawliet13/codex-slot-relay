@@ -47,6 +47,7 @@ If JSON is requested, return valid JSON only.
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_CODEX_INSTRUCTIONS = "You are a stateless API task runner. Return only the assistant reply content."
 DEFAULT_CODEX_USAGE_URL = f"{DEFAULT_CODEX_BASE_URL}/wham/usage"
+RELAY_VERSION = "0.2.1"
 JWT_CLAIM_PATH = "https://api.openai.com/auth"
 PROFILE_CLAIM_PATH = "https://api.openai.com/profile"
 OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -81,6 +82,69 @@ def utc_now() -> datetime:
 
 def utc_now_iso() -> str:
     return utc_now().replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def log_event(event_type: str, **fields: Any) -> None:
+    payload = {
+        "time": utc_now_iso(),
+        "event": event_type,
+    }
+    for key, value in fields.items():
+        if value is None:
+            continue
+        payload[key] = value
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def sanitize_relay_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "listen": config.get("listen"),
+        "profile": config.get("profile"),
+        "workspace": config.get("workspace"),
+        "runtimeRoot": config.get("runtimeRoot"),
+        "usageTtlSeconds": safe_int(config.get("usageTtlSeconds"), 300),
+        "requestTimeoutSeconds": safe_int(config.get("requestTimeoutSeconds"), 180),
+        "thinking": config.get("thinking"),
+        "selectionPolicy": config.get("selectionPolicy"),
+        "thresholds": dict(config.get("thresholds") or {}),
+        "cooldown": dict(config.get("cooldown") or {}),
+        "auth": {"backend": str((config.get("auth") or {}).get("backend") or "native")},
+        "usage": {"backend": str((config.get("usage") or {}).get("backend") or "codex-api")},
+        "runner": {
+            "backend": str((config.get("runner") or {}).get("backend") or "codex-direct"),
+            "agentId": str((config.get("runner") or {}).get("agentId") or "relay"),
+        },
+    }
+
+
+def build_slot_public_snapshot(slot: Dict[str, Any], *, busy: bool = False) -> Dict[str, Any]:
+    usage = dict(slot.get("usage") or {})
+    runtime = dict(slot.get("runtime") or {})
+    source_meta = dict(slot.get("sourceMeta") or {})
+    return {
+        "id": slot.get("id"),
+        "enabled": slot.get("enabled", True),
+        "label": slot.get("label"),
+        "usage": usage,
+        "runtime": runtime,
+        "busy": busy,
+        "sourceMeta": {
+            "email": source_meta.get("email"),
+            "emailLabel": source_meta.get("emailLabel"),
+            "accountId": source_meta.get("accountId"),
+            "profileId": source_meta.get("profileId"),
+            "expires": source_meta.get("expires"),
+            "savedAt": source_meta.get("savedAt"),
+            "usageFingerprint": source_meta.get("usageFingerprint"),
+        },
+    }
 
 
 def parse_pct(line: str) -> int:
@@ -2009,13 +2073,16 @@ def should_retry_upstream_status(status: int) -> bool:
 
 
 def send_raw_http_response(handler: "RelayHandler", status: int, headers: Optional[Dict[str, Any]], body: bytes) -> None:
+    handler._ensure_request_context()
     handler.send_response(status)
     content_type = None
     if headers:
         content_type = headers.get("Content-Type") or headers.get("content-type")
     handler.send_header("Content-Type", content_type or "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
+    handler._write_relay_headers()
     handler.end_headers()
+    handler._record_response(status)
     if body:
         handler.wfile.write(body)
 
@@ -2027,7 +2094,7 @@ def stream_via_slot_gateway(handler: "RelayHandler", path: str, body: Dict[str, 
             "Authorization": f"Bearer {gateway_ctx['token']}",
             "Content-Type": "application/json",
             "Accept": handler.headers.get("Accept", "application/json"),
-            "User-Agent": "CodexSlotRelay/0.1",
+            "User-Agent": f"CodexSlotRelay/{RELAY_VERSION}",
             "x-openclaw-agent-id": "relay",
         }
         session_key = handler.headers.get("x-openclaw-session-key")
@@ -2043,12 +2110,15 @@ def stream_via_slot_gateway(handler: "RelayHandler", path: str, body: Dict[str, 
         try:
             with urllib.request.urlopen(request, timeout=timeout) as resp:
                 if body.get("stream"):
+                    handler._ensure_request_context()
                     handler.send_response(resp.status)
                     handler.send_header("Content-Type", resp.headers.get("Content-Type", "text/event-stream; charset=utf-8"))
                     handler.send_header("Cache-Control", resp.headers.get("Cache-Control", "no-cache"))
                     handler.send_header("Connection", "close")
                     handler.send_header("X-Accel-Buffering", "no")
+                    handler._write_relay_headers()
                     handler.end_headers()
+                    handler._record_response(resp.status)
                     while True:
                         reader = getattr(resp, "read1", None)
                         chunk = reader(4096) if callable(reader) else resp.read(4096)
@@ -2177,6 +2247,21 @@ def clear_slot_error(slot: Dict[str, Any]) -> None:
     slot["runtime"]["lastUsedAt"] = utc_now_iso()
 
 
+def slot_selection_sort_key(selection_policy: str, slot: Dict[str, Any]) -> Tuple[Any, ...]:
+    usage = slot.get("usage", {})
+    runtime = slot.get("runtime", {})
+    five = int(usage.get("fivePct", -1))
+    week = int(usage.get("weekPct", -1))
+    last_used = str(runtime.get("lastUsedAt") or "")
+    slot_id = str(slot.get("id") or "")
+    policy = (selection_policy or "best-week-then-5h").strip().lower()
+    if policy == "best-5h-then-week":
+        return (-five, -week, last_used, slot_id)
+    if policy == "least-recently-used":
+        return (last_used or "", -week, -five, slot_id)
+    return (-week, -five, last_used, slot_id)
+
+
 def choose_slots(config: Dict[str, Any], slots: List[Dict[str, Any]], refresh_if_stale: bool, runtime_root: Path) -> List[Dict[str, Any]]:
     profile = config["profile"]
     ttl = int(config.get("usageTtlSeconds", 300))
@@ -2186,6 +2271,7 @@ def choose_slots(config: Dict[str, Any], slots: List[Dict[str, Any]], refresh_if
 
     min_5h = int(config.get("thresholds", {}).get("min5hPct", 15))
     min_week = int(config.get("thresholds", {}).get("minWeekPct", 10))
+    selection_policy = str(config.get("selectionPolicy") or "best-week-then-5h")
 
     healthy = []
     fallback = []
@@ -2206,14 +2292,7 @@ def choose_slots(config: Dict[str, Any], slots: List[Dict[str, Any]], refresh_if
             healthy.append(slot)
 
     candidates = healthy if healthy else fallback
-    candidates.sort(
-        key=lambda s: (
-            -int(s.get("usage", {}).get("weekPct", -1)),
-            -int(s.get("usage", {}).get("fivePct", -1)),
-            s.get("runtime", {}).get("lastUsedAt", ""),
-            s["id"],
-        )
-    )
+    candidates.sort(key=lambda slot: slot_selection_sort_key(selection_policy, slot))
     return candidates
 
 
@@ -2420,18 +2499,94 @@ def execute_relay_completion(server: "RelayServer", requested_model: str, prompt
 
 
 class RelayHandler(BaseHTTPRequestHandler):
-    server_version = "CodexSlotRelay/0.1"
+    server_version = f"CodexSlotRelay/{RELAY_VERSION}"
+
+    def _ensure_request_context(self, path: Optional[str] = None) -> None:
+        if getattr(self, "_relay_request_id", None):
+            return
+        request_path = path or (self.path or "/").split("?", 1)[0]
+        self._relay_request_id = uuid.uuid4().hex[:12]
+        self._relay_request_started = time.time()
+        self._relay_request_path = request_path
+        self._relay_request_method = getattr(self, "command", "GET")
+        self._relay_selected_slot_id = None
+        self._relay_response_recorded = False
+        with self.server._stats_lock:
+            self.server._stats["inflight"] = int(self.server._stats.get("inflight", 0)) + 1
+        log_event(
+            "request.start",
+            requestId=self._relay_request_id,
+            method=self._relay_request_method,
+            path=request_path,
+            remote=self.client_address[0] if getattr(self, "client_address", None) else None,
+        )
+
+    def _set_selected_slot(self, slot_id: Optional[str]) -> None:
+        if slot_id:
+            self._relay_selected_slot_id = slot_id
+
+    def _write_relay_headers(self) -> None:
+        self._ensure_request_context()
+        self.send_header("X-Relay-Version", RELAY_VERSION)
+        self.send_header("X-Relay-Request-Id", self._relay_request_id)
+        if getattr(self, "_relay_selected_slot_id", None):
+            self.send_header("X-Relay-Slot-Id", self._relay_selected_slot_id)
+
+    def _record_response(self, status: int, *, error: Optional[str] = None) -> None:
+        self._ensure_request_context()
+        if getattr(self, "_relay_response_recorded", False):
+            return
+        self._relay_response_recorded = True
+        duration_ms = int((time.time() - self._relay_request_started) * 1000)
+        self.server.record_request(
+            request_id=self._relay_request_id,
+            method=self._relay_request_method,
+            path=self._relay_request_path,
+            status=status,
+            duration_ms=duration_ms,
+            slot_id=getattr(self, "_relay_selected_slot_id", None),
+            error=error,
+        )
+        log_event(
+            "request.finish",
+            requestId=self._relay_request_id,
+            method=self._relay_request_method,
+            path=self._relay_request_path,
+            status=status,
+            durationMs=duration_ms,
+            slotId=getattr(self, "_relay_selected_slot_id", None),
+            error=error,
+        )
 
     def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
+        self._ensure_request_context()
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._write_relay_headers()
         self.end_headers()
+        self._record_response(status)
         self.wfile.write(body)
 
     def _send_api_error(self, status: int, message: str, error_type: str = "invalid_request_error", code: Optional[str] = None) -> None:
-        self._send_json(status, build_openai_error_payload(message, error_type=error_type, code=code))
+        self._ensure_request_context()
+        body = json.dumps(build_openai_error_payload(message, error_type=error_type, code=code), ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._write_relay_headers()
+        self.end_headers()
+        self._record_response(status, error=message)
+        self.wfile.write(body)
+
+    def log_message(self, fmt: str, *args) -> None:
+        log_event(
+            "http.access",
+            requestId=getattr(self, "_relay_request_id", None),
+            remote=self.client_address[0] if getattr(self, "client_address", None) else None,
+            message=(fmt % args) if args else fmt,
+        )
 
     def _read_json(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -2447,12 +2602,15 @@ class RelayHandler(BaseHTTPRequestHandler):
         return header == f"Bearer {expected}"
 
     def _set_sse_headers(self) -> None:
+        self._ensure_request_context()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.send_header("X-Accel-Buffering", "no")
+        self._write_relay_headers()
         self.end_headers()
+        self._record_response(200)
         try:
             self.wfile.flush()
         except Exception:
@@ -2540,6 +2698,13 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _handle_live_proxy(self, path: str, body: Dict[str, Any]) -> None:
         slots = choose_slots(self.server.relay_config, self.server.slot_store.load_slots(), False, self.server.runtime_root)
+        log_event(
+            "slot.selection",
+            requestId=getattr(self, "_relay_request_id", None),
+            path=path,
+            selectionPolicy=self.server.relay_config.get("selectionPolicy"),
+            candidates=[slot.get("id") for slot in slots[:5]],
+        )
         if not slots:
             raise RelayError("tidak ada slot Codex yang eligible")
 
@@ -2561,6 +2726,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         for slot in slots[:2]:
             try:
                 BUSY_TRACKER.acquire(slot["id"])
+                self._set_selected_slot(slot["id"])
                 if runner_backend == "codex-direct":
                     proxied_ok = stream_via_slot_codex_direct(self, path, body, slot, payload_override=payload_override)
                 else:
@@ -2604,6 +2770,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             return
         prompt = render_messages(messages)
         model, content, _relay_meta = execute_relay_completion(self.server, requested_model, prompt, source_messages=messages)
+        self._set_selected_slot(_relay_meta.get("slot"))
         if body.get("stream"):
             self._send_chat_completion_stream(model, content)
             return
@@ -2620,6 +2787,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             raise RelayError("Missing user message in `input`.")
         prompt = render_messages(messages)
         model, content, _relay_meta = execute_relay_completion(self.server, requested_model, prompt, source_messages=messages)
+        self._set_selected_slot(_relay_meta.get("slot"))
         response_id = f"resp_{uuid.uuid4()}"
         output_item_id = f"msg_{uuid.uuid4()}"
         if body.get("stream"):
@@ -2634,13 +2802,29 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = (self.path or "/").split("?", 1)[0]
+        self._ensure_request_context(path)
         if path in {"/healthz", "/readyz"}:
             slots = self.server.slot_store.load_slots()
+            enabled_slots = [slot for slot in slots if slot.get("enabled", True)]
+            eligible_slots = choose_slots(self.server.relay_config, slots, False, self.server.runtime_root)
             self._send_json(200, {
                 "ok": True,
                 "time": utc_now_iso(),
+                "version": RELAY_VERSION,
+                "listen": self.server.relay_config.get("listen"),
                 "slots": len(slots),
                 "busy": sorted(list(BUSY_TRACKER._busy)),
+                "slotsDetail": {
+                    "total": len(slots),
+                    "enabled": len(enabled_slots),
+                    "eligible": len(eligible_slots),
+                },
+                "selectionPolicy": self.server.relay_config.get("selectionPolicy"),
+                "backends": {
+                    "auth": get_backend_name(self.server.runtime_root, "auth"),
+                    "usage": get_backend_name(self.server.runtime_root, "usage"),
+                    "runner": get_backend_name(self.server.runtime_root, "runner"),
+                },
             })
             return
 
@@ -2649,17 +2833,30 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._send_api_error(401, "Unauthorized", error_type="authentication_error", code="invalid_api_key")
                 return
             slots = self.server.slot_store.load_slots()
-            sanitized = []
-            for slot in slots:
-                sanitized.append({
-                    "id": slot["id"],
-                    "enabled": slot.get("enabled", True),
-                    "label": slot.get("label"),
-                    "usage": slot.get("usage", {}),
-                    "runtime": slot.get("runtime", {}),
-                    "busy": BUSY_TRACKER.is_busy(slot["id"]),
-                })
-            self._send_json(200, {"slots": sanitized})
+            self._send_json(200, {
+                "slots": [build_slot_public_snapshot(slot, busy=BUSY_TRACKER.is_busy(slot["id"])) for slot in slots],
+            })
+            return
+
+        if path == "/admin/stats":
+            if not self._check_auth():
+                self._send_api_error(401, "Unauthorized", error_type="authentication_error", code="invalid_api_key")
+                return
+            self._send_json(200, self.server.stats_payload())
+            return
+
+        if path == "/admin/dependency-map":
+            if not self._check_auth():
+                self._send_api_error(401, "Unauthorized", error_type="authentication_error", code="invalid_api_key")
+                return
+            self._send_json(200, {"dependencyMap": dependency_map(self.server.runtime_root)})
+            return
+
+        if path == "/admin/config":
+            if not self._check_auth():
+                self._send_api_error(401, "Unauthorized", error_type="authentication_error", code="invalid_api_key")
+                return
+            self._send_json(200, {"config": sanitize_relay_config(self.server.relay_config)})
             return
 
         if path == "/v1/models":
@@ -2682,6 +2879,7 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = (self.path or "/").split("?", 1)[0]
+        self._ensure_request_context(path)
         if path == "/admin/refresh-usage":
             if not self._check_auth():
                 self._send_api_error(401, "Unauthorized", error_type="authentication_error", code="invalid_api_key")
@@ -2708,6 +2906,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             status, error_type, code = resolve_error_status(str(exc))
             self._send_api_error(status, str(exc), error_type=error_type, code=code)
         except BrokenPipeError:
+            self._record_response(499, error="broken_pipe")
             return
         except Exception as exc:
             self._send_api_error(500, f"unexpected_error: {exc}", error_type="api_error", code="api_error")
@@ -2719,6 +2918,67 @@ class RelayServer(ThreadingHTTPServer):
         self.runtime_root = runtime_root
         self.relay_config = relay_config
         self.slot_store = SlotStore(runtime_root)
+        self.started_at = utc_now_iso()
+        self.started_epoch = time.time()
+        self._stats_lock = threading.RLock()
+        self._stats = {
+            "requestsTotal": 0,
+            "successTotal": 0,
+            "clientErrorTotal": 0,
+            "serverErrorTotal": 0,
+            "inflight": 0,
+            "byPath": {},
+            "byStatus": {},
+            "recentRequests": [],
+            "recentErrors": [],
+            "lastRequestAt": "",
+            "lastSuccessAt": "",
+            "lastErrorAt": "",
+        }
+
+    def record_request(self, *, request_id: str, method: str, path: str, status: int, duration_ms: int, slot_id: Optional[str], error: Optional[str] = None) -> None:
+        with self._stats_lock:
+            self._stats["inflight"] = max(0, int(self._stats.get("inflight", 0)) - 1)
+            self._stats["requestsTotal"] += 1
+            self._stats["lastRequestAt"] = utc_now_iso()
+            self._stats["byPath"][path] = int(self._stats["byPath"].get(path, 0)) + 1
+            status_key = str(status)
+            self._stats["byStatus"][status_key] = int(self._stats["byStatus"].get(status_key, 0)) + 1
+            if status < 400:
+                self._stats["successTotal"] += 1
+                self._stats["lastSuccessAt"] = utc_now_iso()
+            elif status < 500:
+                self._stats["clientErrorTotal"] += 1
+                self._stats["lastErrorAt"] = utc_now_iso()
+            else:
+                self._stats["serverErrorTotal"] += 1
+                self._stats["lastErrorAt"] = utc_now_iso()
+            request_entry = {
+                "time": utc_now_iso(),
+                "requestId": request_id,
+                "method": method,
+                "path": path,
+                "status": status,
+                "durationMs": duration_ms,
+                "slotId": slot_id,
+            }
+            self._stats["recentRequests"].append(request_entry)
+            self._stats["recentRequests"] = self._stats["recentRequests"][-50:]
+            if error:
+                error_entry = dict(request_entry)
+                error_entry["error"] = error[:500]
+                self._stats["recentErrors"].append(error_entry)
+                self._stats["recentErrors"] = self._stats["recentErrors"][-20:]
+
+    def stats_payload(self) -> Dict[str, Any]:
+        with self._stats_lock:
+            payload = json.loads(json.dumps(self._stats))
+        payload["startedAt"] = self.started_at
+        payload["uptimeSeconds"] = int(max(0, time.time() - self.started_epoch))
+        payload["version"] = RELAY_VERSION
+        payload["config"] = sanitize_relay_config(self.relay_config)
+        payload["dependencyMap"] = dependency_map(self.runtime_root)
+        return payload
 
 
 def serve(runtime_root: Path) -> None:
@@ -2726,7 +2986,8 @@ def serve(runtime_root: Path) -> None:
     listen = config["listen"]
     host, port_str = listen.rsplit(":", 1)
     server = RelayServer((host, int(port_str)), RelayHandler, runtime_root, config)
-    print(f"Codex Slot Relay listening on http://{listen}")
+    print(f"Codex Slot Relay v{RELAY_VERSION} listening on http://{listen}")
+    log_event("server.start", version=RELAY_VERSION, listen=listen, runtimeRoot=str(runtime_root), selectionPolicy=config.get("selectionPolicy"))
     server.serve_forever()
 
 

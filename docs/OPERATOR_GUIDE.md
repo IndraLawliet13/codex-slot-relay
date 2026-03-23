@@ -105,7 +105,21 @@ codex-slot-relay slot-remove --slot slot-5
 codex-slot-relay serve
 ```
 
-## 7) Smoke-test API
+## 7) Observe health and admin state
+
+```bash
+curl -sS http://127.0.0.1:8787/healthz
+curl -sS http://127.0.0.1:8787/admin/slots -H 'Authorization: Bearer relay-dev-token'
+curl -sS http://127.0.0.1:8787/admin/stats -H 'Authorization: Bearer relay-dev-token'
+curl -sS http://127.0.0.1:8787/admin/dependency-map -H 'Authorization: Bearer relay-dev-token'
+```
+
+Useful runtime headers on normal API responses:
+- `X-Relay-Version`
+- `X-Relay-Request-Id`
+- `X-Relay-Slot-Id`
+
+## 8) Smoke-test API
 
 ```bash
 curl -sS http://127.0.0.1:8787/healthz
@@ -114,6 +128,13 @@ curl -sS -X POST http://127.0.0.1:8787/v1/chat/completions \
   -H 'Content-Type: application/json' \
   --data '{"model":"relay-selftest","messages":[{"role":"user","content":"hello"}]}'
 ```
+
+## Selection policy notes
+
+Current supported values in `relay.json`:
+- `best-week-then-5h` (default)
+- `best-5h-then-week`
+- `least-recently-used`
 
 ## Optional migration command
 

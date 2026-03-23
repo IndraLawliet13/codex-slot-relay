@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2.1
+
+Professional polish release.
+
+### Added
+- structured JSON request logs with request-id tracing
+- relay response headers:
+  - `X-Relay-Version`
+  - `X-Relay-Request-Id`
+  - `X-Relay-Slot-Id`
+- admin observability endpoints:
+  - `GET /admin/stats`
+  - `GET /admin/dependency-map`
+  - `GET /admin/config`
+- richer `/healthz` payload with version, backend, and eligibility summary
+- configurable selection policies:
+  - `best-week-then-5h`
+  - `best-5h-then-week`
+  - `least-recently-used`
+
+### Changed
+- `/admin/slots` now returns a richer sanitized slot snapshot
+- relay server/user-agent version strings now align with package versioning
+
 ## v0.2.0
 
 Standalone-first milestone release.
