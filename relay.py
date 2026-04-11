@@ -1051,22 +1051,33 @@ def remove_slot(runtime_root: Path, slot_id: str) -> Dict[str, Any]:
 
 
 def flatten_content(content: Any) -> str:
+    def append_item(parts: List[str], item: Any) -> None:
+        if isinstance(item, dict):
+            item_type = str(item.get("type") or "").lower().strip()
+            if item_type in {"text", "input_text", "output_text"} or isinstance(item.get("text"), str):
+                parts.append(str(item.get("text") or ""))
+                return
+            if extract_image_url_from_content_item(item) is not None:
+                parts.append("[image omitted in POC]")
+                return
+            if item_type == "input_file":
+                parts.append("[file omitted in POC]")
+                return
+        elif isinstance(item, str):
+            parts.append(item)
+
     if isinstance(content, list):
         parts = []
         for item in content:
-            if isinstance(item, dict):
-                item_type = item.get("type")
-                if item_type in {"text", "input_text", "output_text"}:
-                    parts.append(item.get("text", ""))
-                elif item_type in {"image_url", "input_image"}:
-                    parts.append("[image omitted in POC]")
-                elif item_type == "input_file":
-                    parts.append("[file omitted in POC]")
-            elif isinstance(item, str):
-                parts.append(item)
+            append_item(parts, item)
         return "\n".join(part for part in parts if part)
     if isinstance(content, str):
         return content
+    if isinstance(content, dict):
+        parts: List[str] = []
+        append_item(parts, content)
+        if parts:
+            return "\n".join(part for part in parts if part)
     return json.dumps(content, ensure_ascii=False)
 
 
@@ -1480,6 +1491,51 @@ def build_codex_headers(auth: Dict[str, Any], stream: bool, session_key: Optiona
     return headers
 
 
+def extract_non_empty_string(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def extract_image_url_from_content_item(item: Dict[str, Any]) -> Optional[str]:
+    direct_image_url = item.get("image_url")
+    image_url = extract_non_empty_string(direct_image_url)
+    if image_url is not None:
+        return image_url
+
+    if isinstance(direct_image_url, dict):
+        image_url = extract_non_empty_string(direct_image_url.get("url"))
+        if image_url is not None:
+            return image_url
+
+    item_type = str(item.get("type") or "").lower().strip()
+    if item_type in {"image_url", "input_image"}:
+        return extract_non_empty_string(item.get("url"))
+    if "type" not in item and "url" in item and "text" not in item:
+        return extract_non_empty_string(item.get("url"))
+    return None
+
+
+def extract_image_detail_from_content_item(item: Dict[str, Any]) -> Optional[str]:
+    detail = extract_non_empty_string(item.get("detail"))
+    if detail is not None:
+        return detail
+    image_url = item.get("image_url")
+    if isinstance(image_url, dict):
+        return extract_non_empty_string(image_url.get("detail"))
+    return None
+
+
+def is_compatible_content_block(item: Dict[str, Any]) -> bool:
+    item_type = str(item.get("type") or "").lower().strip()
+    if item_type in {"text", "input_text", "output_text", "image_url", "input_image", "input_file"}:
+        return True
+    if isinstance(item.get("text"), str):
+        return True
+    return extract_image_url_from_content_item(item) is not None
+
+
 def content_to_codex_blocks(content: Any, role: str) -> List[Dict[str, Any]]:
     blocks: List[Dict[str, Any]] = []
     block_type = "output_text" if role == "assistant" else "input_text"
@@ -1489,36 +1545,51 @@ def content_to_codex_blocks(content: Any, role: str) -> List[Dict[str, Any]]:
         if value.strip():
             blocks.append({"type": block_type, "text": value})
 
+    def push_item(item: Any) -> None:
+        if isinstance(item, str):
+            push_text(item)
+            return
+        if not isinstance(item, dict):
+            push_text(json.dumps(item, ensure_ascii=False))
+            return
+
+        item_type = str(item.get("type") or "").lower().strip()
+        if item_type in {"text", "input_text", "output_text"} or isinstance(item.get("text"), str):
+            push_text(str(item.get("text") or ""))
+            return
+
+        image_url = extract_image_url_from_content_item(item)
+        if image_url is not None:
+            if role == "assistant":
+                push_text("[image omitted in relay]")
+                return
+            image_block: Dict[str, Any] = {
+                "type": "input_image",
+                "image_url": image_url,
+            }
+            detail = extract_image_detail_from_content_item(item)
+            if detail is not None:
+                image_block["detail"] = detail
+            blocks.append(image_block)
+            return
+
+        if item_type == "input_file":
+            push_text("[file omitted in relay]")
+            return
+
+        push_text(json.dumps(item, ensure_ascii=False))
+
     if isinstance(content, str):
         push_text(content)
         return blocks
 
     if isinstance(content, list):
         for item in content:
-            if isinstance(item, str):
-                push_text(item)
-                continue
-            if not isinstance(item, dict):
-                push_text(json.dumps(item, ensure_ascii=False))
-                continue
-            item_type = str(item.get("type") or "").lower()
-            if item_type in {"text", "input_text", "output_text"}:
-                push_text(str(item.get("text") or ""))
-            elif item_type in {"image_url", "input_image"}:
-                push_text("[image omitted in relay]")
-            elif item_type == "input_file":
-                push_text("[file omitted in relay]")
-            elif isinstance(item.get("text"), str):
-                push_text(str(item.get("text") or ""))
-            else:
-                push_text(json.dumps(item, ensure_ascii=False))
+            push_item(item)
         return blocks
 
     if isinstance(content, dict):
-        if isinstance(content.get("text"), str):
-            push_text(str(content.get("text") or ""))
-        else:
-            push_text(json.dumps(content, ensure_ascii=False))
+        push_item(content)
         return blocks
 
     push_text(json.dumps(content, ensure_ascii=False))
@@ -2412,16 +2483,37 @@ def normalize_responses_input_to_messages(payload: Dict[str, Any]) -> List[Dict[
     else:
         raw_items = []
 
+    pending_content: List[Any] = []
+
+    def flush_pending_content() -> None:
+        nonlocal pending_content
+        if not pending_content:
+            return
+        messages.append({
+            "role": "user",
+            "content": pending_content,
+        })
+        pending_content = []
+
     for item in raw_items:
+        if isinstance(item, str):
+            if item.strip():
+                pending_content.append({
+                    "type": "input_text",
+                    "text": item,
+                })
+            continue
         if not isinstance(item, dict):
             continue
-        item_type = item.get("type")
+        item_type = str(item.get("type") or "").lower().strip()
         if item_type == "message":
+            flush_pending_content()
             messages.append({
                 "role": item.get("role") or "user",
                 "content": item.get("content", ""),
             })
         elif item_type == "function_call_output":
+            flush_pending_content()
             output = item.get("output", "")
             if not isinstance(output, str):
                 output = json.dumps(output, ensure_ascii=False)
@@ -2429,6 +2521,9 @@ def normalize_responses_input_to_messages(payload: Dict[str, Any]) -> List[Dict[
                 "role": "tool",
                 "content": output,
             })
+        elif is_compatible_content_block(item):
+            pending_content.append(item)
+    flush_pending_content()
     return messages
 
 
